@@ -7,8 +7,8 @@ LOGO = r"""
 ██║ ╚═╝ ██║███████╗██║  ██║   ██║   ██║  ██║███████╗██║ ╚═╝ ██║███████╗
 ╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝╚══════╝
 
-MEXTREME v1.1 - Professional Security Assessment Platform
-Version 1.1 | Professional Security Testing Tool
+MEXTREME v2.0 - Evidence-Driven Security Assessment Platform
+Version 2.0 | Low-Noise, Evidence-First Security Scanner
     ----Created by RocketRaccoon------
 """
 
@@ -35,12 +35,13 @@ import urllib3
 from urllib.parse import urlparse, urljoin, parse_qs, quote, unquote, urlencode
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Set, Tuple, Optional, Any
+from typing import List, Dict, Set, Tuple, Optional, Any, Callable
 import string
 from html import escape as html_escape
 from collections import defaultdict
 import math
 import difflib
+from enum import Enum
 
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -62,7 +63,7 @@ class Config:
     DELAY_BETWEEN_REQUESTS = 0.05
     MAX_PARAMS_PER_URL = 10
     
-    # Crawler queue management (NEW: Queue growth control)
+    # Crawler queue management
     MAX_QUEUE_SIZE = 5000
     QUEUE_CHECK_INTERVAL = 100
     
@@ -76,35 +77,91 @@ class Config:
     MAX_RATE_PER_SECOND = 10
     
     # Detection thresholds
-    SQLI_CONFIDENCE_THRESHOLD = 0.7
-    XSS_CONFIDENCE_THRESHOLD = 0.6
     RESPONSE_DIFF_THRESHOLD = 0.1
     TIMING_THRESHOLD_MULTIPLIER = 2.0
     
-    # Timing SQLi settings (NEW: Improved handling)
-    MIN_BASELINE_TIME = 0.1  # Minimum baseline for reliable comparison
-    MAX_BASELINE_TIME = 10.0  # Maximum baseline (too slow = unreliable)
-    TIMING_VARIANCE_THRESHOLD = 0.5  # Allowable timing variance
+    # Timing SQLi settings
+    MIN_BASELINE_TIME = 0.1
+    MAX_BASELINE_TIME = 10.0
+    TIMING_VARIANCE_THRESHOLD = 0.5
     
-    # NEW: Email exposure handling
-    EMAIL_EXPOSURE_MAX_FINDINGS = 3  # Max email findings to report
-    SUPPRESS_PUBLIC_EMAILS = True    # Auto-suppress public contact emails
-    GROUP_EMAIL_FINDINGS = True      # Group duplicate email findings
+    # Email exposure handling
+    EMAIL_EXPOSURE_MAX_FINDINGS = 3
+    SUPPRESS_PUBLIC_EMAILS = True
+    GROUP_EMAIL_FINDINGS = True
     
-    # NEW: URL validation
-    SKIP_EXTERNAL_DOMAINS = True     # Skip external domains in crawler
-    EXTERNAL_DOMAIN_PATTERNS = [     # Patterns to skip
+    # URL validation
+    SKIP_EXTERNAL_DOMAINS = True
+    EXTERNAL_DOMAIN_PATTERNS = [
         r'facebook\.com', r'twitter\.com', r'linkedin\.com',
         r'\.gov\.ph$', r'\.com\.ph$', r'youtube\.com',
         r'instagram\.com', r'\.google\.', r'\.microsoft\.'
     ]
     
+    # Risk scoring weights
+    RISK_WEIGHTS = {
+        'confidence_tier': {
+            'CONFIRMED': 1.0,
+            'LIKELY': 0.7,
+            'POSSIBLE': 0.4,
+            'INFO': 0.1
+        },
+        'severity': {
+            'CRITICAL': 1.0,
+            'HIGH': 0.7,
+            'MEDIUM': 0.4,
+            'LOW': 0.2,
+            'INFO': 0.05
+        },
+        'exposure_factor': {
+            'open_ports': 0.1,
+            'pages_found': 0.05,
+            'subdomains': 0.05,
+            'directory_listings': 0.15
+        }
+    }
+    
+    # Detection modes
+    DETECTOR_MODES = {
+        'default': True,      # Balanced detection
+        'aggressive': False,  # More payloads, lower thresholds
+        'conservative': False # Fewer payloads, higher thresholds
+    }
+    
+    # NEW: Detector configuration
+    ENABLED_DETECTORS = [
+        'sqli-error',
+        'sqli-timing',
+        'xss-reflected',
+        'security-headers',
+        'directory-listing',
+        'email-exposure'
+    ]
+    
+    # NEW: Evidence requirements
+    EVIDENCE_REQUIREMENTS = {
+        'sqli-error': {
+            'min_confidence': 0.7,
+            'required_evidence': ['sql_errors', 'response_diff'],
+            'evidence_options': 2  # Need at least 2 of the evidence types
+        },
+        'sqli-timing': {
+            'min_confidence': 0.8,
+            'required_evidence': ['timing_delay', 'reliable_baseline'],
+            'evidence_options': 2
+        },
+        'xss-reflected': {
+            'min_confidence': 0.6,
+            'required_evidence': ['payload_reflection', 'context_analysis'],
+            'evidence_options': 2
+        }
+    }
+    
     # Modules to enable
     MODULES = {
         'recon': True,
-        'vuln_scan': True,
+        'detectors': True,
         'bruteforce': False,
-        'exploit': False,
         'reporting': True,
         'subdomain_enum': True
     }
@@ -225,13 +282,24 @@ class Colors:
     UNDERLINE = "\033[4m"
     RESET = "\033[0m"
 
+# NEW: Detector Tags
+class DetectorTags(Enum):
+    WEB = "web"
+    INJECTION = "injection"
+    TIMING = "timing"
+    INFO = "info"
+    RECON = "recon"
+    LOW_NOISE = "low-noise"
+    EVIDENCE_DRIVEN = "evidence-driven"
+
 # ───────────────── DATA MODELS ─────────────────
 
 @dataclass
 class Vulnerability:
     """Vulnerability data model"""
     id: str = field(default_factory=lambda: hashlib.md5(str(time.time()).encode()).hexdigest()[:8])
-    type: str = ""
+    detector_id: str = ""
+    name: str = ""
     url: str = ""
     parameter: str = ""
     payload: str = ""
@@ -239,11 +307,11 @@ class Vulnerability:
     response: str = ""
     confidence: float = 0.0
     confidence_tier: str = "INFO"
-    level: str = "INFO"
+    severity: str = "INFO"
     cvss_score: float = 0.0
     cvss_vector: str = ""
+    evidence: Dict = field(default_factory=dict)  # NEW: Structured evidence
     details: Dict = field(default_factory=dict)
-    evidence: str = ""
     remediation: str = ""
     references: List[str] = field(default_factory=list)
     suppressed: bool = False
@@ -294,6 +362,52 @@ class TargetProfile:
     sitemap_xml: str = ""
     technology_stack: Dict = field(default_factory=dict)
     metadata: Dict = field(default_factory=dict)
+    risk_score: float = 0.0  # NEW: Overall risk score
+
+# NEW: Detector Base Class
+@dataclass
+class Detector:
+    """Base detector class"""
+    id: str
+    name: str
+    description: str
+    category: str
+    tags: List[DetectorTags]
+    severity_ceiling: str  # Maximum severity this detector can report
+    confidence_floor: float  # Minimum confidence to report
+    enabled: bool = True
+    
+    # Evidence requirements
+    evidence_requirements: Dict = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Validate detector configuration"""
+        valid_severities = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        if self.severity_ceiling not in valid_severities:
+            raise ValueError(f"Invalid severity ceiling: {self.severity_ceiling}")
+        
+        if not 0 <= self.confidence_floor <= 1:
+            raise ValueError(f"Confidence floor must be between 0 and 1: {self.confidence_floor}")
+    
+    async def run(self, client, profile: TargetProfile, endpoint: Endpoint) -> List[Vulnerability]:
+        """Run detector on an endpoint - to be implemented by subclasses"""
+        raise NotImplementedError("Detector subclasses must implement run()")
+    
+    def meets_evidence_requirements(self, evidence: Dict) -> bool:
+        """Check if evidence meets requirements"""
+        if not self.evidence_requirements:
+            return True
+        
+        required = self.evidence_requirements.get('required_evidence', [])
+        options_needed = self.evidence_requirements.get('evidence_options', len(required))
+        
+        if not required:
+            return True
+        
+        # Count how many required evidence types are present
+        present_count = sum(1 for req in required if req in evidence and evidence[req])
+        
+        return present_count >= options_needed
 
 # ───────────────── HELPER FUNCTIONS ─────────────────
 
@@ -333,17 +447,31 @@ def confidence_to_tier(score: float) -> str:
     else:
         return "INFO"
 
-def confidence_level(score: float) -> str:
-    """Convert confidence score to severity level"""
-    if score >= 0.9:
-        return "CRITICAL"
-    if score >= 0.7:
-        return "HIGH"
-    if score >= 0.5:
-        return "MEDIUM"
-    if score >= 0.3:
-        return "LOW"
-    return "INFO"
+def confidence_to_severity(score: float, ceiling: str = "CRITICAL") -> str:
+    """Convert confidence score to severity with ceiling"""
+    if score >= 0.9 and ceiling in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+        return "CRITICAL" if ceiling == "CRITICAL" else ceiling
+    elif score >= 0.7 and ceiling in ["HIGH", "MEDIUM", "LOW", "INFO"]:
+        return "HIGH" if ceiling == "HIGH" else ceiling
+    elif score >= 0.5 and ceiling in ["MEDIUM", "LOW", "INFO"]:
+        return "MEDIUM" if ceiling == "MEDIUM" else ceiling
+    elif score >= 0.3 and ceiling in ["LOW", "INFO"]:
+        return "LOW" if ceiling == "LOW" else ceiling
+    else:
+        return "INFO"
+
+def calculate_cvss_score(severity: str) -> Tuple[float, str]:
+    """Calculate CVSS score based on severity"""
+    if severity == "CRITICAL":
+        return 9.0, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+    elif severity == "HIGH":
+        return 7.5, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+    elif severity == "MEDIUM":
+        return 5.5, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N"
+    elif severity == "LOW":
+        return 3.1, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+    else:
+        return 1.0, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N"
 
 def extract_technology(headers: Dict, body: str) -> Dict:
     """Extract technology stack from headers and body"""
@@ -374,24 +502,20 @@ def extract_emails(text: str) -> List[str]:
     return list(set(re.findall(pattern, text)))
 
 def should_exclude_url(url: str) -> bool:
-    """Check if URL should be excluded from crawling - FIXED VERSION"""
+    """Check if URL should be excluded from crawling"""
     for pattern in EXCLUDE_PATTERNS:
         if re.search(pattern, url, re.IGNORECASE):
             return True
     
-    # NEW: Skip external domains that got malformed
     if Config.SKIP_EXTERNAL_DOMAINS:
-        # Skip URLs with double slashes that contain domains
         if '//' in url:
             parts = url.split('//')
             if len(parts) > 2:
-                # URL like https://domain.com//facebook.com
                 middle_part = parts[1]
                 if '.' in middle_part and any(ext in middle_part for ext in ['.com', '.ph', '.gov', '.net', '.org']):
                     logger.debug(f"Skipping malformed URL with external domain: {url}")
                     return True
         
-        # Check for external domain patterns
         for pattern in Config.EXTERNAL_DOMAIN_PATTERNS:
             if re.search(pattern, url, re.IGNORECASE):
                 logger.debug(f"Skipping external pattern: {url}")
@@ -442,24 +566,19 @@ def normalize_html_for_diff(html: str) -> str:
     return html.strip()
 
 def normalize_url(url: str) -> str:
-    """Normalize URL to prevent crawler explosion - FIXED VERSION"""
+    """Normalize URL to prevent crawler explosion"""
     try:
         parsed = urlparse(url)
         
-        # FIX: Fix malformed URLs with double slashes
         path = parsed.path
         while '//' in path:
             path = path.replace('//', '/')
         
-        # FIX: Ensure proper netloc
         netloc = parsed.netloc
         if not netloc and parsed.path:
-            # This handles malformed URLs like "//facebook.com"
             if parsed.path.startswith('//'):
-                # This is actually an external URL, should be skipped
                 return url
         
-        # Normalize query parameters
         if parsed.query:
             params = parse_qs(parsed.query, keep_blank_values=True)
             filtered_params = {}
@@ -480,7 +599,6 @@ def normalize_url(url: str) -> str:
         else:
             query = ''
         
-        # Rebuild URL
         normalized = f"{parsed.scheme}://{netloc}{path.rstrip('/') or '/'}"
         if query:
             normalized += f"?{query}"
@@ -493,10 +611,9 @@ def normalize_url(url: str) -> str:
         return url
 
 def detect_database_technology(body: str, headers: Dict) -> Optional[str]:
-    """Detect database technology from response (NEW: DB fingerprinting)"""
+    """Detect database technology from response"""
     body_lower = body.lower()
     
-    # MySQL indicators
     mysql_patterns = [
         r'mysql_',
         r'mysqli_',
@@ -511,7 +628,6 @@ def detect_database_technology(body: str, headers: Dict) -> Optional[str]:
         if re.search(pattern, body_lower, re.IGNORECASE):
             return "MySQL"
     
-    # PostgreSQL indicators
     postgres_patterns = [
         r'postgresql',
         r'pg_',
@@ -523,7 +639,6 @@ def detect_database_technology(body: str, headers: Dict) -> Optional[str]:
         if re.search(pattern, body_lower, re.IGNORECASE):
             return "PostgreSQL"
     
-    # Microsoft SQL Server indicators
     mssql_patterns = [
         r'microsoft.*sql server',
         r'sql server',
@@ -536,7 +651,6 @@ def detect_database_technology(body: str, headers: Dict) -> Optional[str]:
         if re.search(pattern, body_lower, re.IGNORECASE):
             return "MSSQL"
     
-    # Oracle indicators
     oracle_patterns = [
         r'ora-\d{5}',
         r'oracle.*error',
@@ -548,7 +662,6 @@ def detect_database_technology(body: str, headers: Dict) -> Optional[str]:
         if re.search(pattern, body_lower, re.IGNORECASE):
             return "Oracle"
     
-    # SQLite indicators
     sqlite_patterns = [
         r'sqlite',
         r'sqlite3',
@@ -566,21 +679,62 @@ def filter_duplicate_vulnerabilities(vulnerabilities: List[Vulnerability]) -> Li
     seen_patterns = set()
     
     for vuln in vulnerabilities:
-        if vuln.type == "Email Address Exposure":
-            # Create a unique pattern key
-            emails = tuple(sorted(vuln.details.get("emails_found", [])))
-            pattern_key = f"email_{hash(emails)}"
-            
-            if pattern_key in seen_patterns:
-                logger.debug(f"Filtering duplicate email finding: {vuln.url}")
-                continue
-            
-            seen_patterns.add(pattern_key)
+        pattern_key = f"{vuln.detector_id}:{vuln.url}:{vuln.parameter}:{hashlib.md5(vuln.payload.encode()).hexdigest()[:16]}"
         
+        if pattern_key in seen_patterns:
+            logger.debug(f"Filtering duplicate finding: {vuln.name} on {vuln.url}")
+            continue
+        
+        seen_patterns.add(pattern_key)
         unique_vulns.append(vuln)
     
     logger.info(f"Filtered {len(vulnerabilities) - len(unique_vulns)} duplicate findings")
     return unique_vulns
+
+def calculate_risk_score(profile: TargetProfile, vulnerabilities: List[Vulnerability]) -> float:
+    """Calculate overall risk score (0-100)"""
+    base_score = 0.0
+    
+    # Factor 1: Vulnerability findings
+    vuln_weight = 0.6
+    vuln_score = 0.0
+    
+    for vuln in vulnerabilities:
+        if vuln.suppressed:
+            continue
+        
+        tier_weight = Config.RISK_WEIGHTS['confidence_tier'].get(vuln.confidence_tier, 0.1)
+        severity_weight = Config.RISK_WEIGHTS['severity'].get(vuln.severity, 0.05)
+        
+        vuln_score += (tier_weight * severity_weight * 20)  # Max 20 per finding
+    
+    vuln_score = min(vuln_score, 60.0)  # Cap at 60
+    
+    # Factor 2: Exposure factors
+    exposure_weight = 0.4
+    exposure_score = 0.0
+    
+    # Open ports
+    port_score = len(profile.network_info.xposure_factor']['open_ports']
+    
+    # Pages found
+    page_score = min(len(profile.pages) * Config.RISK_WEIGHTS['exposure_factor']['pages_found'], 10)
+    
+    # Subdomains
+    subdomain_score = min(len(profile.subdomains) * Config.RISK_WEIGHTS['exposure_factor']['subdomains'], 5)
+    
+    # Directory listings
+    dir_score = len(profile.network_info.directory_listings) * Config.RISK_WEIGHTS['exposure_factor']['directory_listings']
+    
+    exposure_score = min(port_score + page_score + subdomain_score + dir_score, 40.0)
+    
+    # Combine scores
+    base_score = vuln_score + exposure_score
+    
+    # Normalize to 0-100 scale
+    risk_score = min(base_score, 100.0)
+    
+    return round(risk_score, 1)
 
 # ───────────────── NETWORK SCANNER ─────────────────
 
@@ -758,7 +912,7 @@ class SecureSubdomainEnumerator:
         self.found_subdomains = set()
         self.wildcard_detected = False
         self.wildcard_ips = set()
-        self.resolution_cache = {}  # Cache DNS resolutions
+        self.resolution_cache = {}
     
     async def enumerate(self, client) -> Set[str]:
         """Enumerate subdomains with strict validation"""
@@ -768,13 +922,11 @@ class SecureSubdomainEnumerator:
         
         logger.info(f"Enumerating subdomains for {self.domain}...")
         
-        # Detect wildcard DNS
         await self.detect_wildcard_dns()
         
         if self.wildcard_detected:
             logger.warning(f"Wildcard DNS detected. Results filtered.")
         
-        # Check subdomains
         tasks = []
         for sub in SUBDOMAIN_WORDLIST:
             subdomain = f"{sub}.{self.domain}"
@@ -797,8 +949,7 @@ class SecureSubdomainEnumerator:
         try:
             random_ips_set = set()
             
-            # Test multiple random subdomains
-            for i in range(3):  # Test 3 random subdomains
+            for i in range(3):
                 random_str = hashlib.md5(str(time.time() + i).encode()).hexdigest()[:16]
                 test_subdomain = f"{random_str}.{self.domain}"
                 
@@ -810,9 +961,7 @@ class SecureSubdomainEnumerator:
                 except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
                     continue
             
-            # If all random subdomains resolve to same IP(s), it's likely a wildcard
             if len(random_ips_set) > 0:
-                # Also check that the IPs aren't common "not found" IPs
                 common_placeholder_ips = {'127.0.0.1', '0.0.0.0', '255.255.255.255'}
                 if not random_ips_set.issubset(common_placeholder_ips):
                     self.wildcard_detected = True
@@ -828,7 +977,6 @@ class SecureSubdomainEnumerator:
             return False
         
         try:
-            # Check cache first
             if subdomain in self.resolution_cache:
                 resolved_ips = self.resolution_cache[subdomain]
             else:
@@ -836,14 +984,10 @@ class SecureSubdomainEnumerator:
                 resolved_ips = {str(r) for r in answers}
                 self.resolution_cache[subdomain] = resolved_ips
             
-            # If ALL resolved IPs match wildcard IPs, it's likely a wildcard
-            # NEW: Require exact match, not just subset
             if resolved_ips == self.wildcard_ips:
                 return True
             
-            # NEW: Also check if IPs are in same subnet (e.g., load balancer)
             if len(resolved_ips) > 0 and len(self.wildcard_ips) > 0:
-                # Check if first octet matches (crude but effective)
                 wildcard_first_octets = {ip.split('.')[0] for ip in self.wildcard_ips}
                 resolved_first_octets = {ip.split('.')[0] for ip in resolved_ips}
                 
@@ -859,7 +1003,6 @@ class SecureSubdomainEnumerator:
     async def check_subdomain(self, subdomain: str, client) -> Optional[str]:
         """Check if subdomain exists with HTTP validation"""
         try:
-            # DNS resolution
             try:
                 answers = dns.resolver.resolve(subdomain, 'A')
                 if not answers:
@@ -867,11 +1010,9 @@ class SecureSubdomainEnumerator:
             except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
                 return None
             
-            # Skip if wildcard
             if self.is_wildcard_subdomain(subdomain):
                 return None
             
-            # HTTP validation
             for scheme in ['https', 'http']:
                 url = f"{scheme}://{subdomain}"
                 
@@ -923,7 +1064,7 @@ class SecureSubdomainEnumerator:
 # ───────────────── ASYNC HTTP CLIENT ─────────────────
 
 class EnhancedAsyncHTTPClient:
-    """HTTP client with rate limiting - WITH FIXES"""
+    """HTTP client with rate limiting"""
     
     def __init__(self, scan_id: str):
         self.session = None
@@ -947,7 +1088,6 @@ class EnhancedAsyncHTTPClient:
     async def fetch(self, url: str, method: str = "GET", data: Any = None, 
                    headers: Dict = None, retries: int = 2) -> Tuple[Optional[int], Dict, str]:
         
-        # FIX 1: Always count request attempts
         self.request_count += 1
         
         if self.request_count >= Config.REQUEST_CAP:
@@ -995,6 +1135,953 @@ class EnhancedAsyncHTTPClient:
         
         return None, {}, ""
 
+# ───────────────── DETECTORS ─────────────────
+
+# Base Evidence Analyzers
+class EvidenceAnalyzer:
+    """Base class for evidence analysis"""
+    
+    @staticmethod
+    def analyze_sql_errors(payload_response: str, baseline: str) -> Dict:
+        """Analyze SQL errors in response"""
+        sql_error_patterns = [
+            (r"You have an error in your SQL syntax", "MySQL syntax error"),
+            (r"Warning: mysql", "MySQL warning"),
+            (r"MySQL server version", "MySQL version disclosure"),
+            (r"PostgreSQL.*ERROR", "PostgreSQL error"),
+            (r"ORA-\d{5}", "Oracle error"),
+            (r"Microsoft OLE DB Provider", "SQL Server error"),
+            (r"Incorrect syntax near", "SQL syntax error"),
+            (r"Unclosed quotation mark", "Unclosed quote"),
+            (r"SQLSTATE\[", "SQLSTATE error"),
+            (r"SQLite.*error", "SQLite error"),
+            (r"Driver.*SQL", "SQL driver error"),
+        ]
+        
+        errors_found = []
+        
+        for pattern, description in sql_error_patterns:
+            payload_match = re.search(pattern, payload_response, re.IGNORECASE)
+            if payload_match:
+                baseline_match = re.search(pattern, baseline, re.IGNORECASE)
+                if not baseline_match:
+                    errors_found.append(description)
+                else:
+                    payload_count = len(re.findall(pattern, payload_response, re.IGNORECASE))
+                    baseline_count = len(re.findall(pattern, baseline, re.IGNORECASE))
+                    if payload_count > baseline_count:
+                        errors_found.append(f"{description} (increased)")
+        
+        return {
+            'found': len(errors_found) > 0,
+            'errors': errors_found,
+            'count': len(errors_found)
+        }
+    
+    @staticmethod
+    def analyze_response_diff(baseline: str, payload_response: str) -> Dict:
+        """Analyze response differences"""
+        if not baseline or not payload_response:
+            return {'diff_percent': 1.0, 'significant_difference': True}
+        
+        norm_baseline = normalize_html_for_diff(baseline)
+        norm_payload = normalize_html_for_diff(payload_response)
+        
+        baseline_len = len(norm_baseline)
+        payload_len = len(norm_payload)
+        
+        if baseline_len == 0 or payload_len == 0:
+            return {'diff_percent': 1.0, 'significant_difference': True}
+        
+        matcher = difflib.SequenceMatcher(None, norm_baseline[:5000], norm_payload[:5000])
+        similarity = matcher.ratio()
+        diff_percent = 1 - similarity
+        
+        structural_diff = diff_percent > Config.RESPONSE_DIFF_THRESHOLD
+        
+        error_keywords = ['error', 'exception', 'warning', 'mysql', 'sql', 'syntax']
+        baseline_lower = baseline.lower()
+        payload_lower = payload_response.lower()
+        
+        error_delta = 0
+        for keyword in error_keywords:
+            baseline_count = baseline_lower.count(keyword)
+            payload_count = payload_lower.count(keyword)
+            if payload_count > baseline_count:
+                error_delta += (payload_count - baseline_count)
+        
+        max_error_contribution = 0.15
+        error_boost = min(error_delta * 0.05, max_error_contribution)
+        
+        diff_percent = min(diff_percent + error_boost, 1.0)
+        
+        return {
+            'diff_percent': diff_percent,
+            'significant_difference': structural_diff or diff_percent > Config.RESPONSE_DIFF_THRESHOLD,
+            'similarity': similarity,
+            'error_boost_applied': error_boost
+        }
+    
+    @staticmethod
+    def analyze_timing(payload: str, baseline_time: float, payload_time: float, db_type: Optional[str]) -> Dict:
+        """Analyze timing evidence"""
+        match = False
+        expected_delay = 0
+        reliable = True
+        
+        if baseline_time < Config.MIN_BASELINE_TIME:
+            reliable = False
+            logger.debug(f"Baseline time {baseline_time:.2f}s too fast for reliable timing")
+        elif baseline_time > Config.MAX_BASELINE_TIME:
+            reliable = False
+            logger.debug(f"Baseline time {baseline_time:.2f}s too slow for reliable timing")
+        
+        sleep_patterns = [
+            (r'SLEEP\((\d+)\)', 1, ["MySQL", None]),
+            (r'pg_sleep\((\d+)\)', 1, ["PostgreSQL"]),
+            (r"WAITFOR DELAY '0:0:(\d+)'", 1, ["MSSQL"]),
+            (r"DBMS_PIPE\.RECEIVE_MESSAGE\('a',(\d+)\)", 1, ["Oracle"]),
+            (r'BENCHMARK\((\d+)', 0.000001, ["MySQL"]),
+        ]
+        
+        for pattern, multiplier, supported_dbs in sleep_patterns:
+            match_obj = re.search(pattern, payload, re.IGNORECASE)
+            if match_obj:
+                if db_type and supported_dbs and db_type not in supported_dbs:
+                    logger.debug(f"Payload {pattern} not suitable for detected DB {db_type}")
+                    reliable = False
+                
+                expected_delay = float(match_obj.group(1)) * multiplier
+                break
+        
+        if expected_delay > 0 and reliable:
+            time_difference = payload_time - baseline_time
+            time_ratio = payload_time / baseline_time if baseline_time > 0 else 999
+            
+            if time_ratio >= Config.TIMING_THRESHOLD_MULTIPLIER:
+                min_expected = expected_delay * 0.3
+                max_expected = expected_delay * 3.0
+                
+                if min_expected <= time_difference <= max_expected:
+                    match = True
+                else:
+                    logger.debug(f"Timing delay {time_difference:.2f}s outside expected range [{min_expected:.2f}, {max_expected:.2f}]")
+            else:
+                logger.debug(f"Time ratio {time_ratio:.1f} below threshold {Config.TIMING_THRESHOLD_MULTIPLIER}")
+        
+        return {
+            'match': match,
+            'expected_delay': expected_delay,
+            'actual_delay': payload_time - baseline_time,
+            'time_ratio': payload_time / baseline_time if baseline_time > 0 else 0,
+            'reliable': reliable
+        }
+    
+    @staticmethod
+    def analyze_xss_reflection(payload: str, response: str, baseline: str) -> Dict:
+        """Analyze XSS reflection evidence"""
+        if payload not in response:
+            return {'reflected': False}
+        
+        payload_pos = response.find(payload)
+        if payload_pos == -1:
+            return {'reflected': False}
+        
+        context_start = max(0, payload_pos - 100)
+        context_end = min(len(response), payload_pos + len(payload) + 100)
+        context = response[context_start:context_end]
+        
+        html_encoded = False
+        encoded_patterns = ['&lt;', '&gt;', '&quot;', '&#x27;', '&#x2F;']
+        for pattern in encoded_patterns:
+            if pattern in context:
+                html_encoded = True
+                break
+        
+        partially_encoded = False
+        if '<' in payload and '&lt;' in context:
+            partially_encoded = True
+        
+        escaped = '\\"' in context or "\\'" in context
+        
+        in_script = False
+        before = response[:payload_pos]
+        script_start = before.rfind('<script')
+        script_end = before.rfind('</script')
+        if script_start > script_end:
+            in_script = True
+        
+        in_attribute = False
+        before_context = response[max(0, payload_pos-50):payload_pos]
+        last_double_quote = before_context.rfind('"')
+        last_single_quote = before_context.rfind("'")
+        
+        if last_double_quote > last_single_quote and last_double_quote != -1:
+            in_attribute = True
+        elif last_single_quote > last_double_quote and last_single_quote != -1:
+            in_attribute = True
+        
+        javascript_context = False
+        if 'javascript:' in context.lower() or 'onload=' in context.lower() or 'onerror=' in context.lower():
+            javascript_context = True
+        
+        exploitable = False
+        if in_script and not html_encoded:
+            exploitable = True
+        elif in_attribute and not html_encoded and not escaped:
+            exploitable = True
+        elif javascript_context and not html_encoded:
+            exploitable = True
+        elif not html_encoded and not escaped and not in_attribute and not partially_encoded:
+            exploitable = True
+        
+        return {
+            'reflected': True,
+            'context': context,
+            'html_encoded': html_encoded,
+            'escaped': escaped,
+            'partially_encoded': partially_encoded,
+            'in_script': in_script,
+            'in_attribute': in_attribute,
+            'javascript_context': javascript_context,
+            'exploitable': exploitable
+        }
+
+# SQL Injection Detector
+class SQLInjectionDetector(Detector):
+    """SQL Injection detector with evidence-based detection"""
+    
+    def __init__(self):
+        super().__init__(
+            id="sqli-error",
+            name="SQL Injection (Error-Based)",
+            description="Detects SQL injection vulnerabilities through error responses",
+            category="injection",
+            tags=[DetectorTags.WEB, DetectorTags.INJECTION, DetectorTags.EVIDENCE_DRIVEN, DetectorTags.LOW_NOISE],
+            severity_ceiling="CRITICAL",
+            confidence_floor=0.7,
+            evidence_requirements={
+                'required_evidence': ['sql_errors', 'response_diff', 'status_change'],
+                'evidence_options': 2  # Need at least 2 types of evidence
+            }
+        )
+        self.baseline_cache = {}
+        self.db_type_cache = {}
+    
+    def get_payloads(self, db_type: Optional[str] = None) -> List[str]:
+        """Get SQLi payloads based on detected DB"""
+        generic_payloads = [
+            "'", "\"", "`",
+            "' OR '1'='1", "' OR 'a'='a",
+            "' UNION SELECT NULL--",
+            "' AND 1=1--", "' AND 1=2--",
+        ]
+        
+        if not db_type:
+            return generic_payloads
+        
+        targeted_payloads = generic_payloads.copy()
+        
+        if db_type == "MySQL":
+            targeted_payloads.extend([
+                "' AND SLEEP(1)--",
+                "' OR SLEEP(1)--",
+            ])
+        elif db_type == "PostgreSQL":
+            targeted_payloads.extend([
+                "'; SELECT pg_sleep(1)--",
+                "' OR pg_sleep(1)--",
+            ])
+        elif db_type == "MSSQL":
+            targeted_payloads.extend([
+                "' WAITFOR DELAY '0:0:1'--",
+                "'; WAITFOR DELAY '0:0:1'--",
+            ])
+        
+        return targeted_payloads
+    
+    async def get_baseline(self, url: str, client) -> Tuple[Optional[int], Dict, str, float]:
+        """Get robust baseline"""
+        if url in self.baseline_cache:
+            return self.baseline_cache[url]
+        
+        samples = []
+        sample_bodies = []
+        
+        for i in range(2):
+            sample_start = time.time()
+            sample_status, sample_headers, sample_body = await client.fetch(url)
+            sample_time = time.time() - sample_start
+            
+            if sample_body:
+                samples.append(sample_time)
+                sample_bodies.append(sample_body)
+            
+            if i < 1:
+                await asyncio.sleep(0.1)
+        
+        if not samples:
+            result = (None, {}, "", 0.0)
+            self.baseline_cache[url] = result
+            return result
+        
+        samples_sorted = sorted(samples)
+        baseline_time = samples_sorted[len(samples_sorted) // 2]
+        baseline_body = sample_bodies[0] if sample_bodies else ""
+        baseline_status = 200 if baseline_body else None
+        
+        result = (baseline_status, {}, baseline_body, baseline_time)
+        self.baseline_cache[url] = result
+        
+        return result
+    
+    def detect_db_type(self, body: str, headers: Dict) -> Optional[str]:
+        """Detect database type from response"""
+        body_hash = hashlib.md5(body.encode()).hexdigest()
+        cache_key = f"{body_hash}:{hashlib.md5(str(headers).encode()).hexdigest()}"
+        
+        if cache_key in self.db_type_cache:
+            return self.db_type_cache[cache_key]
+        
+        db_type = detect_database_technology(body, headers)
+        self.db_type_cache[cache_key] = db_type
+        
+        return db_type
+    
+    def calculate_confidence(self, evidence: Dict) -> float:
+        """Calculate confidence based on evidence"""
+        confidence = 0.0
+        
+        # SQL errors are strong evidence
+        if evidence.get('sql_errors', {}).get('found', False):
+            error_count = evidence['sql_errors'].get('count', 0)
+            confidence += min(0.3 + (error_count * 0.1), 0.6)
+        
+        # Response difference
+        if evidence.get('response_diff', {}).get('significant_difference', False):
+            diff_percent = evidence['response_diff'].get('diff_percent', 0)
+            confidence += min(diff_percent * 0.4, 0.4)
+        
+        # Status change
+        if evidence.get('status_change', False):
+            confidence += 0.2
+        
+        # Timing evidence (if present)
+        if evidence.get('timing', {}).get('match', False):
+            if evidence['timing'].get('reliable', False):
+                confidence += 0.3
+            else:
+                confidence += 0.1
+        
+        # Cap at 0.95 to avoid "perfect" scores
+        return min(confidence, 0.95)
+    
+    async def run(self, client, profile: TargetProfile, endpoint: Endpoint) -> List[Vulnerability]:
+        """Run SQLi detection on endpoint"""
+        vulnerabilities = []
+        
+        # Only test parameters that could be vulnerable
+        test_params = [p for p in endpoint.parameters 
+                      if p['type'] in ['identifier', 'generic', 'search', 'pagination']]
+        
+        if not test_params:
+            return vulnerabilities
+        
+        # Get baseline
+        baseline_status, baseline_headers, baseline_body, baseline_time = await self.get_baseline(
+            endpoint.url, client
+        )
+        
+        if not baseline_body:
+            return vulnerabilities
+        
+        # Detect DB type for targeted payloads
+        db_type = self.detect_db_type(baseline_body, baseline_headers)
+        payloads = self.get_payloads(db_type)
+        
+        for param in test_params:
+            for payload in payloads[:5]:  # Limit to 5 payloads per parameter
+                test_url = self.build_test_url(endpoint.url, param['name'], payload)
+                
+                payload_start = time.time()
+                payload_status, payload_headers, payload_body = await client.fetch(test_url)
+                payload_time = time.time() - payload_start
+                
+                if not payload_body:
+                    continue
+                
+                # Collect evidence
+                evidence = {}
+                
+                # SQL errors
+                sql_errors = EvidenceAnalyzer.analyze_sql_errors(payload_body, baseline_body)
+                evidence['sql_errors'] = sql_errors
+                
+                # Response difference
+                response_diff = EvidenceAnalyzer.analyze_response_diff(baseline_body, payload_body)
+                evidence['response_diff'] = response_diff
+                
+                # Status change
+                evidence['status_change'] = baseline_status != payload_status
+                
+                # Timing (if payload has timing)
+                if any(keyword in payload for keyword in ['SLEEP', 'pg_sleep', 'WAITFOR', 'BENCHMARK']):
+                    timing = EvidenceAnalyzer.analyze_timing(payload, baseline_time, payload_time, db_type)
+                    evidence['timing'] = timing
+                
+                # Check evidence requirements
+                if not self.meets_evidence_requirements(evidence):
+                    continue
+                
+                # Calculate confidence
+                confidence = self.calculate_confidence(evidence)
+                
+                if confidence >= self.confidence_floor:
+                    cvss_score, cvss_vector = calculate_cvss_score(
+                        confidence_to_severity(confidence, self.severity_ceiling)
+                    )
+                    
+                    vuln = Vulnerability(
+                        detector_id=self.id,
+                        name=self.name,
+                        url=endpoint.url,
+                        parameter=param['name'],
+                        payload=payload,
+                        response=payload_body[:2000],
+                        confidence=confidence,
+                        confidence_tier=confidence_to_tier(confidence),
+                        severity=confidence_to_severity(confidence, self.severity_ceiling),
+                        cvss_score=cvss_score,
+                        cvss_vector=cvss_vector,
+                        evidence=evidence,
+                        details={
+                            "database_type": db_type,
+                            "errors_found": sql_errors.get('errors', []),
+                            "response_difference": f"{response_diff.get('diff_percent', 0):.1%}",
+                            "baseline_time": f"{baseline_time:.2f}s",
+                            "payload_time": f"{payload_time:.2f}s"
+                        },
+                        remediation="Use parameterized queries or prepared statements. Implement proper input validation and output encoding.",
+                        references=[
+                            "https://owasp.org/www-community/attacks/SQL_Injection",
+                            "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html"
+                        ]
+                    )
+                    
+                    vulnerabilities.append(vuln)
+                    break  # One finding per parameter is enough
+        
+        return vulnerabilities
+    
+    def build_test_url(self, url: str, param_name: str, payload: str) -> str:
+        """Build test URL with payload"""
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        
+        if param_name in params:
+            params[param_name] = [payload]
+        else:
+            params[param_name] = [payload]
+        
+        query_parts = []
+        for p, values in params.items():
+            for v in values:
+                query_parts.append(f"{p}={quote(str(v))}")
+        
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(query_parts)}"
+
+# XSS Detector
+class XSSDetector(Detector):
+    """Cross-Site Scripting detector"""
+    
+    def __init__(self):
+        super().__init__(
+            id="xss-reflected",
+            name="Cross-Site Scripting (Reflected)",
+            description="Detects reflected XSS vulnerabilities",
+            category="injection",
+            tags=[DetectorTags.WEB, DetectorTags.INJECTION, DetectorTags.EVIDENCE_DRIVEN],
+            severity_ceiling="HIGH",
+            confidence_floor=0.6,
+            evidence_requirements={
+                'required_evidence': ['payload_reflection', 'context_analysis'],
+                'evidence_options': 2
+            }
+        )
+        self.payloads = [
+            "<script>alert('XSS')</script>",
+            "\"><script>alert('XSS')</script>",
+            "'><script>alert('XSS')</script>",
+            "<img src=x onerror=alert('XSS')>",
+            "\" onload=\"alert('XSS')\"",
+            "javascript:alert('XSS')",
+        ]
+    
+    async def run(self, client, profile: TargetProfile, endpoint: Endpoint) -> List[Vulnerability]:
+        """Run XSS detection on endpoint"""
+        vulnerabilities = []
+        
+        test_params = [p for p in endpoint.parameters 
+                      if p['type'] in ['generic', 'search', 'identifier', 'file']]
+        
+        if not test_params:
+            return vulnerabilities
+        
+        # Get baseline
+        baseline_status, baseline_headers, baseline_body, _ = await client.fetch(endpoint.url)
+        
+        if not baseline_body:
+            return vulnerabilities
+        
+        for param in test_params:
+            for payload in self.payloads[:3]:  # Limit to 3 payloads
+                test_url = self.build_test_url(endpoint.url, param['name'], payload)
+                
+                payload_status, payload_headers, payload_body = await client.fetch(test_url)
+                
+                if not payload_body:
+                    continue
+                
+                # Analyze reflection
+                reflection = EvidenceAnalyzer.analyze_xss_reflection(payload, payload_body, baseline_body)
+                
+                if not reflection.get('reflected', False):
+                    continue
+                
+                # Collect evidence
+                evidence = {
+                    'payload_reflection': True,
+                    'context_analysis': {
+                        'in_script': reflection.get('in_script', False),
+                        'in_attribute': reflection.get('in_attribute', False),
+                        'javascript_context': reflection.get('javascript_context', False),
+                        'html_encoded': reflection.get('html_encoded', False),
+                        'escaped': reflection.get('escaped', False),
+                        'exploitable': reflection.get('exploitable', False)
+                    }
+                }
+                
+                # Check evidence requirements
+                if not self.meets_evidence_requirements(evidence):
+                    continue
+                
+                # Calculate confidence
+                confidence = self.calculate_confidence(reflection)
+                
+                if confidence >= self.confidence_floor:
+                    cvss_score, cvss_vector = calculate_cvss_score(
+                        confidence_to_severity(confidence, self.severity_ceiling)
+                    )
+                    
+                    vuln = Vulnerability(
+                        detector_id=self.id,
+                        name=self.name,
+                        url=endpoint.url,
+                        parameter=param['name'],
+                        payload=payload,
+                        response=payload_body[:2000],
+                        confidence=confidence,
+                        confidence_tier=confidence_to_tier(confidence),
+                        severity=confidence_to_severity(confidence, self.severity_ceiling),
+                        cvss_score=cvss_score,
+                        cvss_vector=cvss_vector,
+                        evidence=evidence,
+                        details={
+                            "context": reflection.get('context', ''),
+                            "exploitable": reflection.get('exploitable', False),
+                            "in_script_tag": reflection.get('in_script', False),
+                            "in_html_attribute": reflection.get('in_attribute', False),
+                            "html_encoded": reflection.get('html_encoded', False)
+                        },
+                        remediation="Implement proper output encoding. Use Content Security Policy (CSP). Validate and sanitize all user input.",
+                        references=[
+                            "https://owasp.org/www-community/attacks/xss/",
+                            "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html"
+                        ]
+                    )
+                    
+                    vulnerabilities.append(vuln)
+                    break
+        
+        return vulnerabilities
+    
+    def calculate_confidence(self, reflection: Dict) -> float:
+        """Calculate XSS confidence"""
+        confidence = 0.3
+        
+        if reflection.get('exploitable', False):
+            confidence += 0.4
+        
+        if reflection.get('in_script', False):
+            confidence += 0.2
+        
+        if reflection.get('javascript_context', False):
+            confidence += 0.1
+        
+        if reflection.get('partially_encoded', False):
+            confidence -= 0.2
+        
+        if not reflection.get('html_encoded', False):
+            confidence += 0.1
+        
+        return min(confidence, 0.85)
+    
+    def build_test_url(self, url: str, param_name: str, payload: str) -> str:
+        """Build test URL with payload"""
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        
+        if param_name in params:
+            params[param_name] = [payload]
+        else:
+            params[param_name] = [payload]
+        
+        query_parts = []
+        for p, values in params.items():
+            for v in values:
+                query_parts.append(f"{p}={quote(str(v))}")
+        
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(query_parts)}"
+
+# Security Headers Detector
+class SecurityHeadersDetector(Detector):
+    """Security Headers detector"""
+    
+    def __init__(self):
+        super().__init__(
+            id="security-headers",
+            name="Missing Security Headers",
+            description="Detects missing security headers",
+            category="info",
+            tags=[DetectorTags.WEB, DetectorTags.INFO, DetectorTags.LOW_NOISE],
+            severity_ceiling="LOW",
+            confidence_floor=0.4
+        )
+        self.required_headers = {
+            "Strict-Transport-Security": {
+                "description": "HTTP Strict Transport Security (HSTS) not implemented",
+                "remediation": "Implement HSTS to enforce HTTPS connections"
+            },
+            "Content-Security-Policy": {
+                "description": "Content Security Policy (CSP) not implemented",
+                "remediation": "Implement CSP to prevent XSS and other injection attacks"
+            },
+            "X-Frame-Options": {
+                "description": "Clickjacking protection missing",
+                "remediation": "Set X-Frame-Options to DENY or SAMEORIGIN"
+            },
+            "X-Content-Type-Options": {
+                "description": "MIME type sniffing not prevented",
+                "remediation": "Set X-Content-Type-Options: nosniff"
+            },
+            "Referrer-Policy": {
+                "description": "Referrer policy not set",
+                "remediation": "Set Referrer-Policy to strict-origin-when-cross-origin or stricter"
+            }
+        }
+    
+    async def run(self, client, profile: TargetProfile, endpoint: Endpoint) -> List[Vulnerability]:
+        """Run security headers check"""
+        vulnerabilities = []
+        
+        headers = endpoint.headers
+        content_type = headers.get("Content-Type", "").lower()
+        
+        # Only check HTML pages
+        if not content_type.startswith("text/html"):
+            return vulnerabilities
+        
+        missing = []
+        details = {}
+        
+        for header, info in self.required_headers.items():
+            if header not in headers:
+                missing.append(info["description"])
+                details[header] = {
+                    "status": "missing",
+                    "description": info["description"]
+                }
+        
+        if missing:
+            confidence = 0.4 + (len(missing) * 0.1)
+            confidence = min(confidence, 0.9)
+            
+            cvss_score, cvss_vector = calculate_cvss_score("LOW")
+            
+            vuln = Vulnerability(
+                detector_id=self.id,
+                name=self.name,
+                url=endpoint.url,
+                confidence=confidence,
+                confidence_tier=confidence_to_tier(confidence),
+                severity="LOW",
+                cvss_score=cvss_score,
+                cvss_vector=cvss_vector,
+                evidence={"missing_headers": missing},
+                details=details,
+                remediation="Implement all recommended security headers. See OWASP Secure Headers Project.",
+                references=[
+                    "https://owasp.org/www-project-secure-headers/",
+                    "https://securityheaders.com/"
+                ]
+            )
+            
+            vulnerabilities.append(vuln)
+        
+        return vulnerabilities
+
+# Email Exposure Detector
+class EmailExposureDetector(Detector):
+    """Email address exposure detector"""
+    
+    def __init__(self):
+        super().__init__(
+            id="email-exposure",
+            name="Email Address Exposure",
+            description="Detects exposed email addresses",
+            category="info",
+            tags=[DetectorTags.WEB, DetectorTags.INFO, DetectorTags.LOW_NOISE],
+            severity_ceiling="LOW",
+            confidence_floor=0.3
+        )
+        self.public_emails = ['info@sibugay.gov.ph', 'alphaphpn@gmail.com']
+    
+    async def run(self, client, profile: TargetProfile, endpoint: Endpoint) -> List[Vulnerability]:
+        """Run email exposure check"""
+        vulnerabilities = []
+        
+        body = endpoint.body
+        emails = extract_emails(body)
+        
+        if not emails or len(emails) > 5:
+            return vulnerabilities
+        
+        # Skip public contact emails if configured
+        if Config.SUPPRESS_PUBLIC_EMAILS and all(email in self.public_emails for email in emails):
+            logger.debug(f"Suppressing public email finding: {emails}")
+            return vulnerabilities
+        
+        # Determine if it's public contact info
+        is_public = any(email in self.public_emails for email in emails)
+        
+        if is_public:
+            confidence = 0.3
+            severity = "INFO"
+            suppressed = True
+        else:
+            confidence = 0.6
+            severity = "LOW"
+            suppressed = False
+        
+        cvss_score = 1.0 if is_public else 3.1
+        cvss_vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N" if is_public else "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+        
+        vuln = Vulnerability(
+            detector_id=self.id,
+            name=self.name,
+            url=endpoint.url,
+            confidence=confidence,
+            confidence_tier=confidence_to_tier(confidence),
+            severity=severity,
+            cvss_score=cvss_score,
+            cvss_vector=cvss_vector,
+            evidence={"emails_found": emails, "count": len(emails)},
+            details={
+                "emails": emails,
+                "is_public_contact": is_public,
+                "email_count": len(emails)
+            },
+            remediation="Consider obfuscating email addresses or using contact forms for sensitive emails. Use JavaScript-based email protection or image-based email display.",
+            references=[
+                "https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure"
+            ],
+            suppressed=suppressed
+        )
+        
+        vulnerabilities.append(vuln)
+        
+        return vulnerabilities
+
+# Directory Listing Detector
+class DirectoryListingDetector(Detector):
+    """Directory listing detector"""
+    
+    def __init__(self):
+        super().__init__(
+            id="directory-listing",
+            name="Directory Listing Enabled",
+            description="Detects enabled directory listings",
+            category="info",
+            tags=[DetectorTags.WEB, DetectorTags.RECON, DetectorTags.LOW_NOISE],
+            severity_ceiling="MEDIUM",
+            confidence_floor=0.8
+        )
+    
+    async def run(self, client, profile: TargetProfile, endpoint: Endpoint) -> List[Vulnerability]:
+        """Run directory listing check"""
+        vulnerabilities = []
+        
+        # Check if this URL is in directory listings
+        if endpoint.url in profile.network_info.directory_listings:
+            confidence = 0.8
+            cvss_score, cvss_vector = calculate_cvss_score("MEDIUM")
+            
+            vuln = Vulnerability(
+                detector_id=self.id,
+                name=self.name,
+                url=endpoint.url,
+                confidence=confidence,
+                confidence_tier=confidence_to_tier(confidence),
+                severity="MEDIUM",
+                cvss_score=cvss_score,
+                cvss_vector=cvss_vector,
+                evidence={"directory_listing": True},
+                details={
+                    "description": "Directory listing exposes file and directory structure",
+                    "risk": "Information disclosure"
+                },
+                remediation="Disable directory indexing in web server configuration (Apache: Options -Indexes, Nginx: autoindex off, IIS: Directory Browsing disabled).",
+                references=[
+                    "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/04-Review_Webserver_Metafiles_for_Information_Leakage",
+                ]
+            )
+            
+            vulnerabilities.append(vuln)
+        
+        return vulnerabilities
+
+# Detector Registry
+class DetectorRegistry:
+    """Manages detector registration and execution"""
+    
+    def __init__(self):
+        self.detectors = {}
+        self.register_default_detectors()
+    
+    def register_default_detectors(self):
+        """Register all default detectors"""
+        self.register(SQLInjectionDetector())
+        self.register(XSSDetector())
+        self.register(SecurityHeadersDetector())
+        self.register(EmailExposureDetector())
+        self.register(DirectoryListingDetector())
+    
+    def register(self, detector: Detector):
+        """Register a detector"""
+        self.detectors[detector.id] = detector
+    
+    def get_detector(self, detector_id: str) -> Optional[Detector]:
+        """Get detector by ID"""
+        return self.detectors.get(detector_id)
+    
+    def get_enabled_detectors(self, tags: Optional[List[str]] = None, 
+                            exclude_tags: Optional[List[str]] = None) -> List[Detector]:
+        """Get enabled detectors, optionally filtered by tags"""
+        enabled = []
+        
+        for detector in self.detectors.values():
+            if not detector.enabled:
+                continue
+            
+            if detector.id not in Config.ENABLED_DETECTORS:
+                continue
+            
+            # Filter by include tags
+            if tags:
+                detector_tags = {tag.value for tag in detector.tags}
+                if not any(tag in detector_tags for tag in tags):
+                    continue
+            
+            # Filter by exclude tags
+            if exclude_tags:
+                detector_tags = {tag.value for tag in detector.tags}
+                if any(tag in detector_tags for tag in exclude_tags):
+                    continue
+            
+            enabled.append(detector)
+        
+        return enabled
+    
+    async def run_detectors(self, client, profile: TargetProfile, 
+                          detectors: List[Detector]) -> List[Vulnerability]:
+        """Run multiple detectors"""
+        all_vulnerabilities = []
+        
+        for detector in detectors:
+            if Config.DEBUG:
+                logger.info(f"  Running detector: {detector.name}")
+            
+            detector_vulns = []
+            
+            for url, endpoint in profile.pages.items():
+                try:
+                    vulns = await detector.run(client, profile, endpoint)
+                    detector_vulns.extend(vulns)
+                except Exception as e:
+                    logger.error(f"Detector {detector.id} failed on {url}: {e}")
+                    if Config.DEBUG:
+                        import traceback
+                        traceback.print_exc()
+            
+            if detector_vulns:
+                logger.info(f"    ✓ {detector.name}: {len(detector_vulns)} findings")
+                all_vulnerabilities.extend(detector_vulns)
+        
+        return all_vulnerabilities
+    
+    def get_detector_stats(self) -> Dict:
+        """Get detector statistics"""
+        stats = {
+            'total': len(self.detectors),
+            'enabled': len(self.get_enabled_detectors()),
+            'by_category': defaultdict(int),
+            'by_severity': defaultdict(int)
+        }
+        
+        for detector in self.get_enabled_detectors():
+            stats['by_category'][detector.category] += 1
+            
+            # Map severity ceiling to count
+            stats['by_severity'][detector.severity_ceiling] += 1
+        
+        return stats
+    
+    def explain_scan_plan(self, profile: TargetProfile, 
+                         tags: Optional[List[str]] = None,
+                         exclude_tags: Optional[List[str]] = None) -> Dict:
+        """Explain what will be scanned"""
+        detectors = self.get_enabled_detectors(tags, exclude_tags)
+        
+        plan = {
+            'detectors': [],
+            'summary': {
+                'detector_count': len(detectors),
+                'endpoint_count': len(profile.pages),
+                'estimated_requests': 0
+            },
+            'detector_details': []
+        }
+        
+        for detector in detectors:
+            detector_info = {
+                'id': detector.id,
+                'name': detector.name,
+                'category': detector.category,
+                'severity_ceiling': detector.severity_ceiling,
+                'confidence_floor': detector.confidence_floor,
+                'tags': [tag.value for tag in detector.tags],
+                'evidence_requirements': detector.evidence_requirements
+            }
+            
+            plan['detectors'].append(detector.id)
+            plan['detector_details'].append(detector_info)
+            
+            # Estimate requests (very rough)
+            endpoints_with_params = sum(1 for e in profile.pages.values() if e.parameters)
+            plan['summary']['estimated_requests'] += endpoints_with_params * 5  # ~5 payloads per param
+        
+        return plan
+
 # ───────────────── QUEUE-MANAGED WEB CRAWLER ─────────────────
 
 class QueueManagedWebCrawler:
@@ -1009,7 +2096,7 @@ class QueueManagedWebCrawler:
         self.start_time = time.time()
         self.total_requests = 0
         self.url_variations = defaultdict(int)
-        self.queue_growth_checks = 0  # Track queue growth
+        self.queue_growth_checks = 0
         
         self.progress_data = {
             'crawled': 0,
@@ -1027,19 +2114,15 @@ class QueueManagedWebCrawler:
         await self.discover_common_paths()
         
         self.to_crawl.append((self.profile.base_url, 0))
-        
-        # FIX 3: Force root URL to always be processed
         self.visited.discard(normalize_url(self.profile.base_url))
         
         last_update = time.time()
         
         while self.to_crawl and len(self.visited) < Config.MAX_CRAWL_URLS:
-            # NEW: Strict queue size control
             if len(self.to_crawl) > Config.MAX_QUEUE_SIZE:
                 logger.warning(f"Queue size {len(self.to_crawl)} exceeds max {Config.MAX_QUEUE_SIZE}. Truncating.")
                 self.to_crawl = self.to_crawl[:Config.MAX_QUEUE_SIZE]
             
-            # NEW: Periodic queue growth check
             self.queue_growth_checks += 1
             if self.queue_growth_checks % Config.QUEUE_CHECK_INTERVAL == 0:
                 self.analyze_queue_growth()
@@ -1069,16 +2152,10 @@ class QueueManagedWebCrawler:
         current_queue_size = len(self.to_crawl)
         
         if current_queue_size > 1000:
-            # Aggressive filtering when queue is large
             logger.info(f"Queue size: {current_queue_size}. Applying aggressive filtering.")
-            
-            # Sort by depth (shallow first)
             self.to_crawl.sort(key=lambda x: x[1])
-            
-            # Remove deep URLs
             self.to_crawl = [item for item in self.to_crawl if item[1] <= 3]
             
-            # Limit to top N
             if len(self.to_crawl) > Config.MAX_QUEUE_SIZE:
                 self.to_crawl = self.to_crawl[:Config.MAX_QUEUE_SIZE]
     
@@ -1186,7 +2263,6 @@ class QueueManagedWebCrawler:
             url = f"{base_url}{directory}"
             status, headers, body = await self.client.fetch(url)
             
-            # Check even if status is not 200
             if status in [200, 403, 401]:
                 indicators_found = []
                 indicators = [
@@ -1222,7 +2298,6 @@ class QueueManagedWebCrawler:
         """Check URL and record it"""
         status, headers, body = await self.client.fetch(url)
         
-        # Allow more status codes
         if status in [200, 301, 302, 401, 403, 404, 500]:
             endpoint = Endpoint(
                 url=url,
@@ -1241,7 +2316,7 @@ class QueueManagedWebCrawler:
                 endpoint.parameters = self.extract_parameters(url)
     
     async def process_url(self, url: str, depth: int):
-        """Process a single URL - WITH FIXES"""
+        """Process a single URL"""
         normalized_url = normalize_url(url)
         self.visited.add(normalized_url)
         self.total_requests += 1
@@ -1250,11 +2325,7 @@ class QueueManagedWebCrawler:
         status, headers, body = await self.client.fetch(url)
         response_time = time.time() - start_time
         
-        # FIX 2: Allow redirects and auth pages
-        # Old code: if not body or status != 200:
-        # New code:
         if status not in (200, 301, 302, 401, 403, 406, 429):
-            # FIX 4: Log why URLs are skipped
             logger.debug(f"Skipping {url} (status {status})")
             return
         
@@ -1282,7 +2353,6 @@ class QueueManagedWebCrawler:
         else:
             endpoint.parameters = self.extract_parameters(url)
             
-            # Only extract links from successful responses
             if body and status in (200, 301, 302, 401, 403):
                 endpoint.links = self.extract_links(body, url)
                 
@@ -1364,13 +2434,11 @@ class QueueManagedWebCrawler:
         return list(links)
     
     def normalize_link(self, link: str, base_url: str) -> Optional[str]:
-        """Normalize a link - FIXED VERSION"""
+        """Normalize a link"""
         if not link or link.startswith(('#', 'javascript:', 'mailto:', 'tel:', 'data:')):
             return None
         
-        # Handle protocol-relative URLs (//facebook.com)
         if link.startswith('//'):
-            # This is an external URL, skip it
             logger.debug(f"Skipping protocol-relative external URL: {link}")
             return None
         
@@ -1382,9 +2450,7 @@ class QueueManagedWebCrawler:
         elif link.startswith('../'):
             return urljoin(base_url, link)
         elif not link.startswith(('http://', 'https://')):
-            # Check if it looks like a domain
             if '.' in link and any(ext in link for ext in ['.com', '.ph', '.gov', '.net', '.org']):
-                # This looks like an external domain without protocol
                 logger.debug(f"Skipping external domain without protocol: {link}")
                 return None
             return urljoin(base_url + '/', link)
@@ -1393,11 +2459,9 @@ class QueueManagedWebCrawler:
             parsed = urlparse(link)
             base_parsed = urlparse(base_url)
             
-            # Check if it's the same domain
             if parsed.netloc == base_parsed.netloc:
                 return link
             else:
-                # External domain
                 logger.debug(f"Skipping external domain: {parsed.netloc}")
                 return None
         except:
@@ -1405,728 +2469,56 @@ class QueueManagedWebCrawler:
         
         return None
 
-# ───────────────── ADVANCED VULNERABILITY SCANNER ─────────────────
+# ───────────────── DETECTOR ENGINE ─────────────────
 
-class AdvancedVulnerabilityScanner:
-    """Advanced scanner with DB fingerprinting"""
+class DetectorEngine:
+    """Main detector engine"""
     
     def __init__(self, client, profile: TargetProfile):
         self.client = client
         self.profile = profile
+        self.registry = DetectorRegistry()
         self.vulnerabilities = []
-        self.baseline_cache = {}
-        self.database_type_cache = {}  # Cache database detection results
     
-    async def comprehensive_scan(self) -> List[Vulnerability]:
-        """Run all vulnerability scans"""
-        logger.info("Starting advanced vulnerability scan...")
+    async def run_scan(self, tags: Optional[List[str]] = None,
+                      exclude_tags: Optional[List[str]] = None) -> List[Vulnerability]:
+        """Run detector scan"""
+        logger.info("Starting evidence-driven detector scan...")
         
-        await self.scan_sql_injection()
-        await self.scan_xss()
-        await self.scan_sensitive_data()
-        await self.scan_security_headers()
-        await self.scan_directory_listings()
+        detectors = self.registry.get_enabled_detectors(tags, exclude_tags)
         
-        self.vulnerabilities = [v for v in self.vulnerabilities if not v.suppressed]
+        if not detectors:
+            logger.warning("No detectors enabled or matched filter criteria")
+            return []
         
-        logger.info(f"Vulnerability scan complete. Found {len(self.vulnerabilities)} issues")
+        logger.info(f"Running {len(detectors)} detectors:")
+        for detector in detectors:
+            logger.info(f"  • {detector.name} ({detector.category}, severity: {detector.severity_ceiling})")
+        
+        self.vulnerabilities = await self.registry.run_detectors(
+            self.client, self.profile, detectors
+        )
+        
+        # Filter duplicates
+        self.vulnerabilities = filter_duplicate_vulnerabilities(self.vulnerabilities)
+        
+        # Group by detector
+        by_detector = defaultdict(list)
+        for vuln in self.vulnerabilities:
+            by_detector[vuln.detector_id].append(vuln)
+        
+        logger.info(f"\nDetector scan complete. Found {len(self.vulnerabilities)} issues:")
+        for detector_id, vulns in by_detector.items():
+            detector = self.registry.get_detector(detector_id)
+            if detector:
+                logger.info(f"  • {detector.name}: {len(vulns)} findings")
+        
         return self.vulnerabilities
     
-    async def get_robust_baseline(self, url: str) -> Tuple[Optional[int], Dict, str, float]:
-        """Get robust baseline with timing validation (NEW: Improved timing)"""
-        if url in self.baseline_cache:
-            return self.baseline_cache[url]
-        
-        # NEW: Take multiple samples for timing accuracy
-        samples = []
-        sample_bodies = []
-        
-        for i in range(3):  # Take 3 samples
-            sample_start = time.time()
-            sample_status, sample_headers, sample_body = await self.client.fetch(url)
-            sample_time = time.time() - sample_start
-            
-            if sample_body:
-                samples.append(sample_time)
-                sample_bodies.append(sample_body)
-            
-            # Small delay between samples
-            if i < 2:
-                await asyncio.sleep(0.1)
-        
-        if not samples:
-            result = (None, {}, "", 0.0)
-            self.baseline_cache[url] = result
-            return result
-        
-        # Use median time for stability
-        samples_sorted = sorted(samples)
-        baseline_time = samples_sorted[len(samples_sorted) // 2]
-        
-        # Use first successful body
-        baseline_body = sample_bodies[0] if sample_bodies else ""
-        baseline_status = 200 if baseline_body else None
-        baseline_headers = {}
-        
-        result = (baseline_status, baseline_headers, baseline_body, baseline_time)
-        self.baseline_cache[url] = result
-        
-        # NEW: Log if baseline timing is problematic
-        if baseline_time < Config.MIN_BASELINE_TIME:
-            logger.debug(f"Baseline time {baseline_time:.2f}s too fast for reliable timing SQLi")
-        elif baseline_time > Config.MAX_BASELINE_TIME:
-            logger.debug(f"Baseline time {baseline_time:.2f}s too slow for reliable timing SQLi")
-        
-        return result
-    
-    def detect_database_for_url(self, url: str, body: str, headers: Dict) -> Optional[str]:
-        """Detect database technology for a URL (NEW: DB fingerprinting)"""
-        if url in self.database_type_cache:
-            return self.database_type_cache[url]
-        
-        db_type = detect_database_technology(body, headers)
-        self.database_type_cache[url] = db_type
-        
-        if db_type:
-            logger.debug(f"Detected {db_type} for {url}")
-        
-        return db_type
-    
-    def get_targeted_sqli_payloads(self, db_type: Optional[str]) -> List[str]:
-        """Get targeted SQLi payloads based on detected DB (NEW)"""
-        generic_payloads = [
-            "'", "\"", "`",
-            "' OR '1'='1", "' OR 'a'='a",
-            "' UNION SELECT NULL--",
-        ]
-        
-        if not db_type:
-            # If DB unknown, try all timing payloads
-            return generic_payloads + [
-                "1' AND SLEEP(3)--",  # MySQL
-                "1'; SELECT pg_sleep(3)--",  # PostgreSQL
-                "' WAITFOR DELAY '0:0:3'--",  # MSSQL
-            ]
-        
-        targeted_payloads = generic_payloads.copy()
-        
-        if db_type == "MySQL":
-            targeted_payloads.extend([
-                "1' AND SLEEP(3)--",
-                "' OR SLEEP(3)--",
-                "1' AND BENCHMARK(1000000,MD5('test'))--",
-            ])
-        elif db_type == "PostgreSQL":
-            targeted_payloads.extend([
-                "1'; SELECT pg_sleep(3)--",
-                "' OR pg_sleep(3)--",
-                "1'; SELECT pg_sleep(3) FROM pg_stat_activity--",
-            ])
-        elif db_type == "MSSQL":
-            targeted_payloads.extend([
-                "' WAITFOR DELAY '0:0:3'--",
-                "1' WAITFOR DELAY '0:0:3'--",
-                "1'; WAITFOR DELAY '0:0:3'--",
-            ])
-        elif db_type == "Oracle":
-            targeted_payloads.extend([
-                "' AND DBMS_PIPE.RECEIVE_MESSAGE('a',3)--",
-                "1' AND DBMS_PIPE.RECEIVE_MESSAGE('a',3)--",
-            ])
-        elif db_type == "SQLite":
-            targeted_payloads.extend([
-                "' OR 1=1--",
-                "1' OR 1=1--",
-            ])
-        
-        return targeted_payloads
-    
-    async def scan_sql_injection(self) -> List[Vulnerability]:
-        """Advanced SQL Injection scanning with DB fingerprinting"""
-        logger.info("  Scanning for SQL Injection (advanced)...")
-        vulns = []
-        
-        for url, endpoint in self.profile.pages.items():
-            for param in endpoint.parameters:
-                if param['type'] in ['identifier', 'generic', 'search', 'pagination']:
-                    # Get robust baseline
-                    baseline_status, baseline_headers, baseline_body, baseline_time = await self.get_robust_baseline(url)
-                    
-                    if not baseline_body:
-                        continue
-                    
-                    # NEW: Detect database type for targeted payloads
-                    db_type = self.detect_database_for_url(url, baseline_body, baseline_headers)
-                    payloads = self.get_targeted_sqli_payloads(db_type)
-                    
-                    for payload in payloads:
-                        test_url = self.build_test_url(url, param['name'], payload)
-                        
-                        payload_start = time.time()
-                        payload_status, payload_headers, payload_body = await self.client.fetch(test_url)
-                        payload_time = time.time() - payload_start
-                        
-                        if not payload_body:
-                            continue
-                        
-                        comparison = self.enhanced_compare_responses(baseline_body, payload_body)
-                        sql_errors = self.detect_sql_errors(payload_body, baseline_body)
-                        
-                        # NEW: Improved timing analysis with baseline validation
-                        timing_analysis = self.robust_analyze_timing(
-                            payload, baseline_time, payload_time, db_type
-                        )
-                        
-                        confidence = self.calculate_sqli_confidence(
-                            sql_errors, comparison, payload, timing_analysis, db_type
-                        )
-                        
-                        if confidence >= Config.SQLI_CONFIDENCE_THRESHOLD:
-                            vuln = Vulnerability(
-                                type="SQL Injection",
-                                url=url,
-                                parameter=param['name'],
-                                payload=payload,
-                                response=payload_body[:2000],
-                                confidence=confidence,
-                                confidence_tier=confidence_to_tier(confidence),
-                                level=confidence_level(confidence),
-                                cvss_score=8.8 if confidence >= 0.7 else 5.0,
-                                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" if confidence >= 0.7 else "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
-                                details={
-                                    "errors": sql_errors['errors'],
-                                    "response_diff": comparison['diff_percent'],
-                                    "status_diff": baseline_status != payload_status,
-                                    "timing_delay": f"{payload_time - baseline_time:.2f}s",
-                                    "baseline_time": f"{baseline_time:.2f}s",
-                                    "payload_time": f"{payload_time:.2f}s",
-                                    "timing_match": timing_analysis['match'],
-                                    "database_type": db_type,
-                                    "timing_reliable": timing_analysis['reliable']
-                                },
-                                remediation="Use parameterized queries or prepared statements",
-                                references=[
-                                    "https://owasp.org/www-community/attacks/SQL_Injection",
-                                    "https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html"
-                                ]
-                            )
-                            vulns.append(vuln)
-                            break
-        
-        self.vulnerabilities.extend(vulns)
-        return vulns
-    
-    def enhanced_compare_responses(self, baseline: str, payload_response: str) -> Dict:
-        """Compare responses with controlled error weighting"""
-        if not baseline or not payload_response:
-            return {'diff_percent': 1.0, 'significant_difference': True}
-        
-        norm_baseline = normalize_html_for_diff(baseline)
-        norm_payload = normalize_html_for_diff(payload_response)
-        
-        baseline_len = len(norm_baseline)
-        payload_len = len(norm_payload)
-        
-        if baseline_len == 0 or payload_len == 0:
-            return {'diff_percent': 1.0, 'significant_difference': True}
-        
-        matcher = difflib.SequenceMatcher(None, norm_baseline[:5000], norm_payload[:5000])
-        similarity = matcher.ratio()
-        diff_percent = 1 - similarity
-        
-        structural_diff = diff_percent > Config.RESPONSE_DIFF_THRESHOLD
-        
-        error_keywords = ['error', 'exception', 'warning', 'mysql', 'sql', 'syntax']
-        baseline_lower = baseline.lower()
-        payload_lower = payload_response.lower()
-        
-        error_delta = 0
-        for keyword in error_keywords:
-            baseline_count = baseline_lower.count(keyword)
-            payload_count = payload_lower.count(keyword)
-            if payload_count > baseline_count:
-                error_delta += (payload_count - baseline_count)
-        
-        max_error_contribution = 0.15
-        error_boost = min(error_delta * 0.05, max_error_contribution)
-        
-        diff_percent = min(diff_percent + error_boost, 1.0)
-        
-        return {
-            'diff_percent': diff_percent,
-            'significant_difference': structural_diff or diff_percent > Config.RESPONSE_DIFF_THRESHOLD,
-            'similarity': similarity,
-            'error_boost_applied': error_boost
-        }
-    
-    def detect_sql_errors(self, payload_response: str, baseline: str) -> Dict:
-        """Detect SQL errors in response"""
-        sql_error_patterns = [
-            (r"You have an error in your SQL syntax", "MySQL syntax error"),
-            (r"Warning: mysql", "MySQL warning"),
-            (r"MySQL server version", "MySQL version disclosure"),
-            (r"PostgreSQL.*ERROR", "PostgreSQL error"),
-            (r"ORA-\d{5}", "Oracle error"),
-            (r"Microsoft OLE DB Provider", "SQL Server error"),
-            (r"Incorrect syntax near", "SQL syntax error"),
-            (r"Unclosed quotation mark", "Unclosed quote"),
-            (r"SQLSTATE\[", "SQLSTATE error"),
-            (r"SQLite.*error", "SQLite error"),
-            (r"Driver.*SQL", "SQL driver error"),
-        ]
-        
-        errors_found = []
-        
-        for pattern, description in sql_error_patterns:
-            payload_match = re.search(pattern, payload_response, re.IGNORECASE)
-            if payload_match:
-                baseline_match = re.search(pattern, baseline, re.IGNORECASE)
-                if not baseline_match:
-                    errors_found.append(description)
-                else:
-                    payload_count = len(re.findall(pattern, payload_response, re.IGNORECASE))
-                    baseline_count = len(re.findall(pattern, baseline, re.IGNORECASE))
-                    if payload_count > baseline_count:
-                        errors_found.append(f"{description} (increased)")
-        
-        return {
-            'found': len(errors_found) > 0,
-            'errors': errors_found
-        }
-    
-    def robust_analyze_timing(self, payload: str, baseline_time: float, 
-                            payload_time: float, db_type: Optional[str]) -> Dict:
-        """Robust timing analysis with baseline validation (NEW)"""
-        match = False
-        expected_delay = 0
-        reliable = True
-        
-        # NEW: Check if baseline timing is reliable
-        if baseline_time < Config.MIN_BASELINE_TIME:
-            reliable = False
-            logger.debug(f"Baseline time {baseline_time:.2f}s too fast for reliable timing")
-        elif baseline_time > Config.MAX_BASELINE_TIME:
-            reliable = False
-            logger.debug(f"Baseline time {baseline_time:.2f}s too slow for reliable timing")
-        
-        # Extract expected sleep time
-        sleep_patterns = [
-            (r'SLEEP\((\d+)\)', 1, ["MySQL", None]),  # MySQL SLEEP
-            (r'pg_sleep\((\d+)\)', 1, ["PostgreSQL"]),  # PostgreSQL
-            (r"WAITFOR DELAY '0:0:(\d+)'", 1, ["MSSQL"]),  # MSSQL
-            (r"DBMS_PIPE\.RECEIVE_MESSAGE\('a',(\d+)\)", 1, ["Oracle"]),  # Oracle
-            (r'BENCHMARK\((\d+)', 0.000001, ["MySQL"]),  # MySQL BENCHMARK (microseconds)
-        ]
-        
-        for pattern, multiplier, supported_dbs in sleep_patterns:
-            match_obj = re.search(pattern, payload, re.IGNORECASE)
-            if match_obj:
-                # NEW: Check if payload matches detected DB
-                if db_type and supported_dbs and db_type not in supported_dbs:
-                    logger.debug(f"Payload {pattern} not suitable for detected DB {db_type}")
-                    reliable = False
-                
-                expected_delay = float(match_obj.group(1)) * multiplier
-                break
-        
-        # Check if payload actually caused a delay
-        if expected_delay > 0 and reliable:
-            time_difference = payload_time - baseline_time
-            time_ratio = payload_time / baseline_time if baseline_time > 0 else 999
-            
-            # NEW: More sophisticated timing validation
-            if time_ratio >= Config.TIMING_THRESHOLD_MULTIPLIER:
-                # Check if delay is within expected range
-                min_expected = expected_delay * 0.3  # At least 30% of expected
-                max_expected = expected_delay * 3.0  # At most 3x expected (network variance)
-                
-                if min_expected <= time_difference <= max_expected:
-                    match = True
-                else:
-                    logger.debug(f"Timing delay {time_difference:.2f}s outside expected range [{min_expected:.2f}, {max_expected:.2f}]")
-            else:
-                logger.debug(f"Time ratio {time_ratio:.1f} below threshold {Config.TIMING_THRESHOLD_MULTIPLIER}")
-        
-        return {
-            'match': match,
-            'expected_delay': expected_delay,
-            'actual_delay': payload_time - baseline_time,
-            'time_ratio': payload_time / baseline_time if baseline_time > 0 else 0,
-            'reliable': reliable
-        }
-    
-    def calculate_sqli_confidence(self, sql_errors: Dict, comparison: Dict, 
-                                payload: str, timing: Dict, db_type: Optional[str]) -> float:
-        """Calculate confidence score for SQL injection"""
-        confidence = 0.0
-        
-        if sql_errors['found']:
-            confidence += 0.6
-        
-        if comparison['significant_difference']:
-            confidence += 0.3
-        
-        # Timing evidence with reliability check
-        if timing['match']:
-            if timing['reliable']:
-                confidence += 0.5  # High confidence for reliable timing
-            else:
-                confidence += 0.3  # Lower confidence for unreliable timing
-        elif any(keyword in payload for keyword in ['SLEEP', 'pg_sleep', 'WAITFOR', 'BENCHMARK']):
-            # Timing payload but no delay
-            confidence -= 0.1
-        
-        # NEW: Bonus for DB-specific payload matching detected DB
-        if db_type:
-            db_specific = False
-            if db_type == "MySQL" and ("SLEEP" in payload or "BENCHMARK" in payload):
-                db_specific = True
-            elif db_type == "PostgreSQL" and "pg_sleep" in payload:
-                db_specific = True
-            elif db_type == "MSSQL" and "WAITFOR" in payload:
-                db_specific = True
-            elif db_type == "Oracle" and "DBMS_PIPE" in payload:
-                db_specific = True
-            
-            if db_specific:
-                confidence += 0.1
-        
-        if "' UNION SELECT" in payload:
-            confidence += 0.1
-        
-        return max(0.0, min(confidence, 0.95))
-    
-    async def scan_xss(self) -> List[Vulnerability]:
-        """Scan for XSS"""
-        logger.info("  Scanning for XSS...")
-        vulns = []
-        
-        for url, endpoint in self.profile.pages.items():
-            for param in endpoint.parameters:
-                if param['type'] in ['generic', 'search', 'identifier', 'file']:
-                    baseline_status, baseline_headers, baseline_body, _ = await self.get_robust_baseline(url)
-                    if not baseline_body:
-                        continue
-                    
-                    for payload in self.get_xss_payloads():
-                        test_url = self.build_test_url(url, param['name'], payload)
-                        
-                        payload_status, payload_headers, payload_body = await self.client.fetch(test_url)
-                        if not payload_body:
-                            continue
-                        
-                        reflection_analysis = self.enhanced_xss_reflection_analysis(payload, payload_body, baseline_body)
-                        
-                        if reflection_analysis['reflected']:
-                            confidence = self.calculate_xss_confidence(reflection_analysis)
-                            if confidence >= Config.XSS_CONFIDENCE_THRESHOLD:
-                                if confidence >= 0.9:
-                                    confidence = 0.85
-                                
-                                vuln = Vulnerability(
-                                    type="Cross-Site Scripting (XSS)",
-                                    url=url,
-                                    parameter=param['name'],
-                                    payload=payload,
-                                    response=payload_body[:2000],
-                                    confidence=confidence,
-                                    confidence_tier=confidence_to_tier(confidence),
-                                    level="LOW" if confidence < 0.7 else "MEDIUM",
-                                    cvss_score=4.0 if confidence < 0.7 else 6.1,
-                                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
-                                    details={
-                                        "context": reflection_analysis['context'],
-                                        "escaped": reflection_analysis['escaped'],
-                                        "html_encoded": reflection_analysis['html_encoded'],
-                                        "in_script": reflection_analysis['in_script'],
-                                        "in_attribute": reflection_analysis['in_attribute'],
-                                        "exploitable": reflection_analysis['exploitable']
-                                    },
-                                    remediation="Implement proper output encoding and Content Security Policy",
-                                    references=[
-                                        "https://owasp.org/www-community/attacks/xss/",
-                                        "https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html"
-                                    ]
-                                )
-                                vulns.append(vuln)
-                                break
-        
-        self.vulnerabilities.extend(vulns)
-        return vulns
-    
-    def get_xss_payloads(self):
-        """Get XSS payloads"""
-        return [
-            "<script>alert('XSS')</script>",
-            "\"><script>alert('XSS')</script>",
-            "'><script>alert('XSS')</script>",
-            "<img src=x onerror=alert('XSS')>",
-            "\" onload=\"alert('XSS')\"",
-            "javascript:alert('XSS')",
-        ]
-    
-    def enhanced_xss_reflection_analysis(self, payload: str, response: str, baseline: str) -> Dict:
-        """Analyze XSS reflection"""
-        if payload not in response:
-            return {'reflected': False}
-        
-        payload_pos = response.find(payload)
-        if payload_pos == -1:
-            return {'reflected': False}
-        
-        context_start = max(0, payload_pos - 100)
-        context_end = min(len(response), payload_pos + len(payload) + 100)
-        context = response[context_start:context_end]
-        
-        html_encoded = False
-        encoded_patterns = ['&lt;', '&gt;', '&quot;', '&#x27;', '&#x2F;']
-        for pattern in encoded_patterns:
-            if pattern in context:
-                html_encoded = True
-                break
-        
-        partially_encoded = False
-        if '<' in payload and '&lt;' in context:
-            partially_encoded = True
-        
-        escaped = '\\"' in context or "\\'" in context
-        
-        in_script = False
-        before = response[:payload_pos]
-        script_start = before.rfind('<script')
-        script_end = before.rfind('</script')
-        if script_start > script_end:
-            in_script = True
-        
-        in_attribute = False
-        before_context = response[max(0, payload_pos-50):payload_pos]
-        last_double_quote = before_context.rfind('"')
-        last_single_quote = before_context.rfind("'")
-        
-        if last_double_quote > last_single_quote and last_double_quote != -1:
-            in_attribute = True
-        elif last_single_quote > last_double_quote and last_single_quote != -1:
-            in_attribute = True
-        
-        javascript_context = False
-        if 'javascript:' in context.lower() or 'onload=' in context.lower() or 'onerror=' in context.lower():
-            javascript_context = True
-        
-        exploitable = False
-        if in_script and not html_encoded:
-            exploitable = True
-        elif in_attribute and not html_encoded and not escaped:
-            exploitable = True
-        elif javascript_context and not html_encoded:
-            exploitable = True
-        elif not html_encoded and not escaped and not in_attribute and not partially_encoded:
-            exploitable = True
-        
-        return {
-            'reflected': True,
-            'context': context,
-            'html_encoded': html_encoded,
-            'escaped': escaped,
-            'partially_encoded': partially_encoded,
-            'in_script': in_script,
-            'in_attribute': in_attribute,
-            'javascript_context': javascript_context,
-            'exploitable': exploitable
-        }
-    
-    def calculate_xss_confidence(self, analysis: Dict) -> float:
-        """Calculate XSS confidence"""
-        confidence = 0.3
-        
-        if analysis['exploitable']:
-            confidence += 0.4
-        
-        if analysis['in_script']:
-            confidence += 0.2
-        
-        if analysis['javascript_context']:
-            confidence += 0.1
-        
-        if analysis['partially_encoded']:
-            confidence -= 0.2
-        
-        if not analysis['html_encoded']:
-            confidence += 0.1
-        
-        return min(confidence, 0.85)
-    
-    async def scan_sensitive_data(self) -> List[Vulnerability]:
-        """Scan for sensitive data - WITH GROUPING AND FILTERING"""
-        logger.info("  Scanning for sensitive data...")
-        vulns = []
-        
-        # Group emails by content hash to avoid duplicates
-        email_findings = defaultdict(list)
-        
-        for url, endpoint in self.profile.pages.items():
-            body = endpoint.body
-            emails = extract_emails(body)
-            
-            if emails and len(emails) <= 5:
-                # Create content hash for grouping
-                content_hash = hashlib.md5(body.encode()).hexdigest()[:16]
-                email_tuple = tuple(sorted(set(emails)))
-                
-                email_findings[(email_tuple, content_hash)].append(url)
-        
-        # Create one finding per unique email set
-        processed_count = 0
-        for (emails, content_hash), urls in email_findings.items():
-            if processed_count >= Config.EMAIL_EXPOSURE_MAX_FINDINGS:
-                break
-                
-            processed_count += 1
-            
-            # Skip public contact emails if configured
-            public_emails = ['info@sibugay.gov.ph', 'alphaphpn@gmail.com']
-            if Config.SUPPRESS_PUBLIC_EMAILS and all(email in public_emails for email in emails):
-                logger.debug(f"Suppressing public email finding: {emails}")
-                continue
-            
-            # Determine severity
-            is_public = any(email in public_emails for email in emails)
-            
-            if is_public:
-                confidence = 0.3
-                level = "INFO"
-                cvss_score = 1.0
-                suppressed = True
-            else:
-                confidence = 0.6
-                level = "LOW"
-                cvss_score = 3.1
-                suppressed = False
-            
-            # Take the shortest/cleanest URL as representative
-            representative_url = min(urls, key=len)
-            
-            vuln = Vulnerability(
-                type="Email Address Exposure",
-                url=representative_url,
-                response="",  # Don't store full response
-                confidence=confidence,
-                confidence_tier=confidence_to_tier(confidence),
-                level=level,
-                cvss_score=cvss_score,
-                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N" if cvss_score > 1.0 else "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
-                details={
-                    "emails_found": list(emails),
-                    "affected_urls": urls[:10],  # Limit to first 10 URLs
-                    "total_affected_urls": len(urls),
-                    "grouping_key": content_hash,
-                    "is_public_contact": is_public
-                },
-                remediation="Consider obfuscating email addresses or using contact forms for sensitive emails",
-                references=[
-                    "https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure"
-                ],
-                suppressed=suppressed
-            )
-            vulns.append(vuln)
-        
-        self.vulnerabilities.extend(vulns)
-        logger.info(f"  Email exposure findings: {len(vulns)} (grouped from {sum(len(urls) for urls in email_findings.values())} URLs)")
-        return vulns
-    
-    async def scan_security_headers(self) -> List[Vulnerability]:
-        """Scan for missing security headers"""
-        logger.info("  Scanning security headers...")
-        vulns = []
-        
-        for url, endpoint in self.profile.pages.items():
-            headers = endpoint.headers
-            content_type = headers.get("Content-Type", "").lower()
-            
-            if not content_type.startswith("text/html"):
-                continue
-            
-            missing = []
-            security_headers = {
-                "Strict-Transport-Security": "HSTS not implemented",
-                "Content-Security-Policy": "CSP not implemented",
-                "X-Frame-Options": "Clickjacking protection missing",
-                "X-Content-Type-Options": "MIME sniffing not prevented",
-                "Referrer-Policy": "Referrer policy not set",
-            }
-            
-            for header, message in security_headers.items():
-                if header not in headers:
-                    missing.append(message)
-            
-            if missing:
-                vuln = Vulnerability(
-                    type="Missing Security Headers",
-                    url=url,
-                    confidence=0.4,
-                    confidence_tier="INFO",
-                    level="LOW",
-                    cvss_score=2.5,
-                    cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N",
-                    details={"missing_headers": missing},
-                    remediation="Implement recommended security headers",
-                    references=[
-                        "https://owasp.org/www-project-secure-headers/",
-                        "https://securityheaders.com/"
-                    ]
-                )
-                
-                if vuln.level == "LOW":
-                    vuln.suppressed = True
-                
-                vulns.append(vuln)
-        
-        self.vulnerabilities.extend(vulns)
-        return vulns
-    
-    async def scan_directory_listings(self) -> List[Vulnerability]:
-        """Scan directory listings"""
-        logger.info("  Scanning directory listings...")
-        vulns = []
-        
-        for dir_url in self.profile.network_info.directory_listings:
-            vuln = Vulnerability(
-                type="Directory Listing Enabled",
-                url=dir_url,
-                confidence=0.8,
-                confidence_tier="LIKELY",
-                level="MEDIUM",
-                cvss_score=5.3,
-                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
-                details={
-                    "description": "Directory listing exposes file and directory structure",
-                    "risk": "Information disclosure"
-                },
-                remediation="Disable directory indexing in web server configuration",
-                references=[
-                    "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/04-Review_Webserver_Metafiles_for_Information_Leakage",
-                ]
-            )
-            vulns.append(vuln)
-        
-        self.vulnerabilities.extend(vulns)
-        return vulns
-    
-    def build_test_url(self, url: str, param_name: str, payload: str) -> str:
-        """Build test URL with payload"""
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        
-        if param_name in params:
-            params[param_name] = [payload]
-        else:
-            params[param_name] = [payload]
-        
-        query_parts = []
-        for p, values in params.items():
-            for v in values:
-                query_parts.append(f"{p}={quote(str(v))}")
-        
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(query_parts)}"
+    def explain_scan(self, tags: Optional[List[str]] = None,
+                    exclude_tags: Optional[List[str]] = None) -> Dict:
+        """Explain what will be scanned"""
+        return self.registry.explain_scan_plan(self.profile, tags, exclude_tags)
 
 # ───────────────── INTEGRATED REPORT GENERATOR ─────────────────
 
@@ -2144,6 +2536,9 @@ class IntegratedReportGenerator:
         os.makedirs(self.output_dir, exist_ok=True)
         
         logger.info("Generating integrated reports...")
+        
+        # Calculate risk score
+        self.profile.risk_score = calculate_risk_score(self.profile, self.vulnerabilities)
         
         html_file = self.generate_html_report()
         json_file = self.generate_json_report()
@@ -2166,7 +2561,12 @@ class IntegratedReportGenerator:
         possible = len(vulns_by_tier.get("POSSIBLE", []))
         info = len(vulns_by_tier.get("INFO", []))
         
-        html = self._generate_html_template(confirmed, likely, possible, info, total_vulns)
+        # Group by detector
+        by_detector = defaultdict(list)
+        for vuln in self.vulnerabilities:
+            by_detector[vuln.detector_id].append(vuln)
+        
+        html = self._generate_html_template(confirmed, likely, possible, info, total_vulns, by_detector)
         
         with open(filename, "w", encoding="utf-8") as f:
             f.write(html)
@@ -2174,8 +2574,16 @@ class IntegratedReportGenerator:
         logger.info(f"HTML report generated: {filename}")
         return filename
     
-    def _generate_html_template(self, confirmed, likely, possible, info, total_vulns):
+    def _generate_html_template(self, confirmed, likely, possible, info, total_vulns, by_detector):
         """Generate HTML template"""
+        risk_color = "green"
+        if self.profile.risk_score >= 70:
+            risk_color = "red"
+        elif self.profile.risk_score >= 40:
+            risk_color = "orange"
+        elif self.profile.risk_score >= 20:
+            risk_color = "yellow"
+        
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2199,6 +2607,8 @@ class IntegratedReportGenerator:
         .severity-medium {{ background: #f1c40f; color: #333; }}
         .severity-low {{ background: #3498db; color: white; }}
         .severity-info {{ background: #95a5a6; color: white; }}
+        .risk-score {{ font-size: 3em; font-weight: bold; color: {risk_color}; text-align: center; margin: 20px 0; }}
+        .evidence-box {{ background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; margin: 10px 0; font-family: monospace; font-size: 12px; }}
         table {{ width: 100%; border-collapse: collapse; margin: 15px 0; background: white; border-radius: 8px; overflow: hidden; }}
         th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #dee2e6; }}
         th {{ background: #2c3e50; color: white; }}
@@ -2208,6 +2618,8 @@ class IntegratedReportGenerator:
         .toggle-btn {{ background: #2c3e50; color: white; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; margin: 10px 0; }}
         .hidden {{ display: none; }}
         .note-box {{ background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 15px 0; border-radius: 5px; }}
+        .detector-stats {{ display: flex; flex-wrap: wrap; gap: 15px; margin: 20px 0; }}
+        .detector-stat {{ background: #e9ecef; padding: 15px; border-radius: 8px; flex: 1; min-width: 200px; }}
     </style>
 </head>
 <body>
@@ -2216,11 +2628,14 @@ class IntegratedReportGenerator:
             <h1>🔒 Security Assessment Report</h1>
             <h2>Target: {self.profile.base_url}</h2>
             <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Scan ID: {self.scan_id}</p>
-            <p><strong>MEXTREME v1.1</strong> - Professional Security Scanner</p>
+            <p><strong>MEXTREME v2.0</strong> - Evidence-Driven Security Scanner</p>
         </div>
         
         <div class="section">
             <h2>📈 Executive Summary</h2>
+            <div class="risk-score">
+                Risk Score: {self.profile.risk_score}/100
+            </div>
             <div class="summary-grid">
                 <div class="summary-card">
                     <h3>CONFIRMED</h3>
@@ -2240,6 +2655,22 @@ class IntegratedReportGenerator:
                 </div>
             </div>
             <p>Total findings: <strong>{total_vulns}</strong></p>
+            
+            <div class="detector-stats">
+                <div class="detector-stat">
+                    <h4>Discovery Results</h4>
+                    <p>• Pages: {len(self.profile.pages)}</p>
+                    <p>• Assets: {len(self.profile.assets)}</p>
+                    <p>• Subdomains: {len(self.profile.subdomains)}</p>
+                    <p>• Open Ports: {len(self.profile.network_info.open_ports)}</p>
+                </div>
+                <div class="detector-stat">
+                    <h4>Scan Statistics</h4>
+                    <p>• Duration: {self.profile.metadata.get('duration', 0):.1f}s</p>
+                    <p>• Requests: {self.profile.metadata.get('total_requests', 0)}</p>
+                    <p>• Detectors Run: {len(by_detector)}</p>
+                </div>
+            </div>
         </div>
         
         <div class="section">
@@ -2256,6 +2687,7 @@ class IntegratedReportGenerator:
                 <li><strong>Access Control:</strong> Review and restrict access</li>
                 <li><strong>Monitoring:</strong> Implement regular security assessments</li>
             </ul>
+            <p><strong>Positioning Statement:</strong> MEXTREME is a low-noise, evidence-driven security assessment engine focused on accuracy, explainability, and report-quality findings — not template volume.</p>
         </div>
     </div>
     
@@ -2284,20 +2716,38 @@ class IntegratedReportGenerator:
     
     def _generate_vuln_card(self, vuln: Vulnerability, index: int) -> str:
         """Generate HTML card for a vulnerability"""
+        evidence_html = ""
+        if vuln.evidence:
+            evidence_html = "<div class='evidence-box'>"
+            for key, value in vuln.evidence.items():
+                if isinstance(value, dict):
+                    evidence_html += f"<strong>{key}:</strong><br>"
+                    for k, v in value.items():
+                        evidence_html += f"&nbsp;&nbsp;{k}: {v}<br>"
+                else:
+                    evidence_html += f"<strong>{key}:</strong> {value}<br>"
+            evidence_html += "</div>"
+        
         return f"""
         <div class="vuln-card">
-            <h4>#{index}: {html_escape(vuln.type)} 
+            <h4>#{index}: {html_escape(vuln.name)} 
                 <span class="tier-badge tier-{vuln.confidence_tier.lower()}">{vuln.confidence_tier}</span>
-                <span class="severity-badge severity-{vuln.level.lower()}">{vuln.level}</span>
+                <span class="severity-badge severity-{vuln.severity.lower()}">{vuln.severity}</span>
             </h4>
+            <p><strong>Detector:</strong> {html_escape(vuln.detector_id)}</p>
             <p><strong>URL:</strong> {html_escape(vuln.url)}</p>
             {f'<p><strong>Parameter:</strong> {html_escape(vuln.parameter)}</p>' if vuln.parameter else ''}
             {f'<p><strong>Payload:</strong> <code>{html_escape(vuln.payload)}</code></p>' if vuln.payload else ''}
-            <p><strong>Confidence:</strong> {vuln.confidence:.0%}</p>
+            <p><strong>Confidence:</strong> {vuln.confidence:.0%} | <strong>CVSS:</strong> {vuln.cvss_score}/10</p>
+            
+            <h5>Evidence:</h5>
+            {evidence_html}
+            
             <button class="toggle-btn" onclick="toggleDetails('details-{vuln.id}')">Show Details</button>
             <div id="details-{vuln.id}" class="hidden">
-                {f'<p><strong>Evidence:</strong></p><pre class="pre">{html_escape(vuln.response[:1000])}</pre>' if vuln.response else ''}
+                {f'<p><strong>Response:</strong></p><pre class="pre">{html_escape(vuln.response[:1000])}</pre>' if vuln.response else ''}
                 {f'<p><strong>Remediation:</strong> {html_escape(vuln.remediation)}</p>' if vuln.remediation else ''}
+                {f'<p><strong>References:</strong><ul>{"".join(f"<li>{html_escape(ref)}</li>" for ref in vuln.references)}</ul></p>' if vuln.references else ''}
             </div>
         </div>
         """
@@ -2311,9 +2761,11 @@ class IntegratedReportGenerator:
                 "scan_id": self.scan_id,
                 "scan_date": datetime.now().isoformat(),
                 "target": self.profile.base_url,
-                "tool": "MEXTREME v1.1",
+                "tool": "MEXTREME v2.0 - Evidence-Driven Security Scanner",
                 "duration": self.profile.metadata.get("duration", 0),
-                "requests": self.profile.metadata.get("total_requests", 0)
+                "requests": self.profile.metadata.get("total_requests", 0),
+                "risk_score": self.profile.risk_score,
+                "positioning": "Low-noise, evidence-driven security assessment engine focused on accuracy and explainability"
             },
             "reconnaissance": {
                 "network": asdict(self.profile.network_info),
@@ -2322,9 +2774,24 @@ class IntegratedReportGenerator:
             "discovery": {
                 "pages_found": len(self.profile.pages),
                 "assets_found": len(self.profile.assets),
+                "directory_listings": self.profile.network_info.directory_listings
             },
             "findings": {
                 "total": len(self.vulnerabilities),
+                "risk_score": self.profile.risk_score,
+                "by_confidence_tier": {
+                    "CONFIRMED": len([v for v in self.vulnerabilities if v.confidence_tier == "CONFIRMED"]),
+                    "LIKELY": len([v for v in self.vulnerabilities if v.confidence_tier == "LIKELY"]),
+                    "POSSIBLE": len([v for v in self.vulnerabilities if v.confidence_tier == "POSSIBLE"]),
+                    "INFO": len([v for v in self.vulnerabilities if v.confidence_tier == "INFO"])
+                },
+                "by_severity": {
+                    "CRITICAL": len([v for v in self.vulnerabilities if v.severity == "CRITICAL"]),
+                    "HIGH": len([v for v in self.vulnerabilities if v.severity == "HIGH"]),
+                    "MEDIUM": len([v for v in self.vulnerabilities if v.severity == "MEDIUM"]),
+                    "LOW": len([v for v in self.vulnerabilities if v.severity == "LOW"]),
+                    "INFO": len([v for v in self.vulnerabilities if v.severity == "INFO"])
+                },
                 "vulnerabilities": [v.to_dict() for v in self.vulnerabilities]
             }
         }
@@ -2343,23 +2810,49 @@ class IntegratedReportGenerator:
             f.write(f"# Executive Security Assessment Summary\n\n")
             f.write(f"**Target:** {self.profile.base_url}\n")
             f.write(f"**Scan ID:** {self.scan_id}\n")
-            f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Risk Score:** {self.profile.risk_score}/100\n\n")
             
-            f.write("## Key Findings\n\n")
+            f.write("## 🔍 Scan Overview\n\n")
+            f.write(f"**Tool:** MEXTREME v2.0 - Evidence-Driven Security Scanner\n")
+            f.write(f"**Positioning:** Low-noise, evidence-driven security assessment engine focused on accuracy, explainability, and report-quality findings — not template volume.\n\n")
+            
+            f.write("## 📊 Key Findings\n\n")
             
             critical_vulns = [v for v in self.vulnerabilities if v.confidence_tier in ["CONFIRMED", "LIKELY"]]
             if critical_vulns:
                 f.write(f"**Critical Findings:** {len(critical_vulns)}\n")
                 for vuln in critical_vulns[:5]:
-                    f.write(f"- {vuln.type} ({vuln.level}) - {vuln.url}\n")
+                    f.write(f"- {vuln.name} ({vuln.severity}, {vuln.confidence:.0%} confidence) - {vuln.url}\n")
             else:
                 f.write("**No critical findings detected.**\n")
             
-            f.write("\n## Technical Overview\n\n")
-            f.write(f"- Pages discovered: {len(self.profile.pages)}\n")
-            f.write(f"- Assets discovered: {len(self.profile.assets)}\n")
-            f.write(f"- Open ports: {len(self.profile.network_info.open_ports)}\n")
-            f.write(f"- Subdomains: {len(self.profile.subdomains)}\n")
+            f.write("\n## 🎯 Technical Overview\n\n")
+            f.write(f"- **Pages discovered:** {len(self.profile.pages)}\n")
+            f.write(f"- **Assets discovered:** {len(self.profile.assets)}\n")
+            f.write(f"- **Open ports:** {len(self.profile.network_info.open_ports)}\n")
+            f.write(f"- **Subdomains:** {len(self.profile.subdomains)}\n")
+            f.write(f"- **Directory listings:** {len(self.profile.network_info.directory_listings)}\n")
+            f.write(f"- **Total requests:** {self.profile.metadata.get('total_requests', 0)}\n")
+            f.write(f"- **Scan duration:** {self.profile.metadata.get('duration', 0):.1f}s\n\n")
+            
+            f.write("## 🛡️ Evidence-Driven Approach\n\n")
+            f.write("This assessment used MEXTREME's evidence-driven detection engine, which requires:\n")
+            f.write("1. **Multiple evidence types** for high-confidence findings\n")
+            f.write("2. **Structured evidence collection** for reproducibility\n")
+            f.write("3. **Configurable confidence thresholds** to reduce false positives\n")
+            f.write("4. **Detector-based architecture** for modular, explainable testing\n\n")
+            
+            f.write("## 🚨 Risk Assessment\n\n")
+            f.write(f"**Overall Risk Score:** {self.profile.risk_score}/100\n")
+            if self.profile.risk_score >= 70:
+                f.write("**Risk Level:** HIGH - Immediate remediation required\n")
+            elif self.profile.risk_score >= 40:
+                f.write("**Risk Level:** MEDIUM - Address within next patch cycle\n")
+            elif self.profile.risk_score >= 20:
+                f.write("**Risk Level:** LOW - Consider in future updates\n")
+            else:
+                f.write("**Risk Level:** MINIMAL - Maintain current security posture\n")
         
         logger.info(f"Executive summary generated: {filename}")
         return filename
@@ -2367,7 +2860,7 @@ class IntegratedReportGenerator:
 # ───────────────── MAIN APPLICATION ─────────────────
 
 class FinalMextremeScanner:
-    """Final production-ready scanner"""
+    """Final production-ready scanner with detector architecture"""
     
     def __init__(self):
         self.profile = None
@@ -2375,8 +2868,11 @@ class FinalMextremeScanner:
         self.scan_start_time = None
         self.scan_end_time = None
         self.scan_id = None
+        self.detector_engine = None
     
-    async def scan(self, target_url: str) -> Dict:
+    async def scan(self, target_url: str, tags: Optional[List[str]] = None,
+                  exclude_tags: Optional[List[str]] = None,
+                  explain_only: bool = False) -> Dict:
         """Main scanning function"""
         self.scan_start_time = time.time()
         self.scan_id = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -2395,6 +2891,10 @@ class FinalMextremeScanner:
         
         self.display_banner()
         
+        if explain_only:
+            await self.explain_scan(target_url, tags, exclude_tags)
+            return {"status": "explained"}
+        
         # PHASE 1: Network Recon
         await self.phase1_enhanced_recon(parsed.netloc)
         
@@ -2403,9 +2903,9 @@ class FinalMextremeScanner:
             await self.phase1a_secure_subdomain_enum(client, parsed.netloc)
             await self.phase2_web_recon(client)
             
-            # PHASE 3: Vulnerability Assessment
-            if Config.MODULES['vuln_scan'] and self.profile.pages:
-                await self.phase3_vuln_assessment(client)
+            # PHASE 3: Detector-Based Assessment
+            if Config.MODULES['detectors'] and self.profile.pages:
+                await self.phase3_detector_assessment(client, tags, exclude_tags)
         
         # PHASE 4: Reporting
         await self.phase4_reporting()
@@ -2414,15 +2914,58 @@ class FinalMextremeScanner:
             "profile": self.profile,
             "vulnerabilities": self.vulnerabilities,
             "scan_id": self.scan_id,
-            "duration": self.scan_end_time - self.scan_start_time
+            "duration": self.scan_end_time - self.scan_start_time,
+            "risk_score": self.profile.risk_score
         }
+    
+    async def explain_scan(self, target_url: str, tags: Optional[List[str]] = None,
+                          exclude_tags: Optional[List[str]] = None):
+        """Explain what will be scanned"""
+        print(f"\n{Colors.BLUE}[EXPLAIN MODE] Scan Plan for {target_url}{Colors.RESET}")
+        print(f"{Colors.BLUE}{'='*60}{Colors.RESET}")
+        
+        # Create a minimal profile for explanation
+        parsed = urlparse(target_url)
+        profile = TargetProfile(base_url=target_url, domain=parsed.netloc)
+        
+        # Create detector engine for explanation
+        engine = DetectorEngine(None, profile)
+        plan = engine.explain_scan(tags, exclude_tags)
+        
+        print(f"\n{Colors.CYAN}📋 Detectors to Run:{Colors.RESET} {plan['summary']['detector_count']}")
+        for detector in plan['detector_details']:
+            tag_str = ", ".join(detector['tags'])
+            print(f"  • {Colors.GREEN}{detector['name']}{Colors.RESET}")
+            print(f"    Category: {detector['category']} | Max Severity: {detector['severity_ceiling']}")
+            print(f"    Min Confidence: {detector['confidence_floor']} | Tags: {tag_str}")
+        
+        print(f"\n{Colors.CYAN}📊 Estimated Scan:{Colors.RESET}")
+        print(f"  • Endpoints to test: {plan['summary']['endpoint_count']}")
+        print(f"  • Estimated requests: ~{plan['summary']['estimated_requests']}")
+        
+        if tags:
+            print(f"\n{Colors.CYAN}🔖 Included Tags:{Colors.RESET} {', '.join(tags)}")
+        if exclude_tags:
+            print(f"{Colors.CYAN}🚫 Excluded Tags:{Colors.RESET} {', '.join(exclude_tags)}")
+        
+        print(f"\n{Colors.YELLOW}💡 Evidence Requirements:{Colors.RESET}")
+        print("  • SQL Injection: Requires 2+ evidence types (errors, response diff, timing)")
+        print("  • XSS: Requires reflection + context analysis")
+        print("  • Findings are suppressed if evidence requirements aren't met")
+        
+        print(f"\n{Colors.PURPLE}🎯 Positioning:{Colors.RESET}")
+        print("  MEXTREME is a low-noise, evidence-driven security assessment engine")
+        print("  focused on accuracy, explainability, and report-quality findings")
+        print("  — not template volume.")
+        
+        print(f"\n{Colors.GREEN}✅ Ready to scan. Remove --explain to execute.{Colors.RESET}")
     
     def display_banner(self):
         print()
         print(Colors.CYAN + LOGO + Colors.RESET)
         print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
-        print(f"{Colors.BOLD}{f'MEXTREME v1.1 - PROFESSIONAL SECURITY SCANNER':^70}{Colors.RESET}")
-        print(f"{Colors.BOLD}{'Production-ready':^70}{Colors.RESET}")
+        print(f"{Colors.BOLD}{f'MEXTREME v2.0 - EVIDENCE-DRIVEN SECURITY ASSESSMENT':^70}{Colors.RESET}")
+        print(f"{Colors.BOLD}{'Low-Noise | Evidence-First | Report-Quality':^70}{Colors.RESET}")
         print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
         print(f"{Colors.CYAN}Target:{Colors.RESET} {self.profile.base_url}")
         print(f"{Colors.CYAN}Scan ID:{Colors.RESET} {self.scan_id}")
@@ -2472,32 +3015,46 @@ class FinalMextremeScanner:
         
         self.profile.metadata['total_requests'] = client.request_count
     
-    async def phase3_vuln_assessment(self, client):
-        """Advanced vulnerability assessment"""
-        print(f"\n{Colors.BLUE}[PHASE 3] ADVANCED VULNERABILITY ASSESSMENT{Colors.RESET}")
+    async def phase3_detector_assessment(self, client, tags: Optional[List[str]] = None,
+                                        exclude_tags: Optional[List[str]] = None):
+        """Detector-based vulnerability assessment"""
+        print(f"\n{Colors.BLUE}[PHASE 3] DETECTOR-BASED VULNERABILITY ASSESSMENT{Colors.RESET}")
         print(f"{Colors.BLUE}{'='*50}{Colors.RESET}")
-        print(f"{Colors.CYAN}  Database fingerprinting enabled{Colors.RESET}")
-        print(f"{Colors.CYAN}  Improved timing SQLi detection{Colors.RESET}")
-        print(f"{Colors.CYAN}  Email grouping and filtering enabled{Colors.RESET}")
+        print(f"{Colors.CYAN}  Evidence-driven detection engine{Colors.RESET}")
+        print(f"{Colors.CYAN}  Structured evidence collection{Colors.RESET}")
+        print(f"{Colors.CYAN}  Configurable confidence thresholds{Colors.RESET}")
         
-        scanner = AdvancedVulnerabilityScanner(client, self.profile)
-        self.vulnerabilities = await scanner.comprehensive_scan()
+        self.detector_engine = DetectorEngine(client, self.profile)
+        self.vulnerabilities = await self.detector_engine.run_scan(tags, exclude_tags)
         
-        # NEW: Filter duplicate findings
+        # Filter duplicates
         self.vulnerabilities = filter_duplicate_vulnerabilities(self.vulnerabilities)
         
+        # Calculate statistics
         by_tier = defaultdict(list)
+        by_severity = defaultdict(list)
+        by_detector = defaultdict(list)
+        
         for vuln in self.vulnerabilities:
             by_tier[vuln.confidence_tier].append(vuln)
+            by_severity[vuln.severity].append(vuln)
+            by_detector[vuln.detector_id].append(vuln)
         
-        print(f"{Colors.GREEN}  ✓ CONFIRMED:{Colors.RESET} {len(by_tier.get('CONFIRMED', []))}")
+        print(f"\n{Colors.GREEN}  ✓ CONFIRMED:{Colors.RESET} {len(by_tier.get('CONFIRMED', []))}")
         print(f"{Colors.YELLOW}  ✓ LIKELY:{Colors.RESET} {len(by_tier.get('LIKELY', []))}")
         print(f"{Colors.CYAN}  ✓ POSSIBLE:{Colors.RESET} {len(by_tier.get('POSSIBLE', []))}")
         print(f"{Colors.BLUE}  ✓ INFO:{Colors.RESET} {len(by_tier.get('INFO', []))}")
         print(f"{Colors.PURPLE}  ✓ Total Findings:{Colors.RESET} {len(self.vulnerabilities)}")
         
+        # Show detector breakdown
+        print(f"\n{Colors.CYAN}  Detector Breakdown:{Colors.RESET}")
+        for detector_id, vulns in by_detector.items():
+            detector = self.detector_engine.registry.get_detector(detector_id)
+            if detector:
+                print(f"    • {detector.name}: {len(vulns)}")
+        
         # Show suppressed count
-        suppressed = sum(1 for v in scanner.vulnerabilities if v.suppressed)
+        suppressed = sum(1 for v in self.vulnerabilities if v.suppressed)
         if suppressed > 0:
             print(f"{Colors.CYAN}  ✓ Suppressed:{Colors.RESET} {suppressed} (public emails, etc.)")
     
@@ -2534,6 +3091,7 @@ class FinalMextremeScanner:
         print(f"  • Pages: {len(self.profile.pages)}")
         print(f"  • Assets: {len(self.profile.assets)}")
         print(f"  • Subdomains: {len(self.profile.subdomains)}")
+        print(f"  • Open Ports: {len(self.profile.network_info.open_ports)}")
         
         print(f"\n{Colors.CYAN}⚠️  Vulnerability Findings:{Colors.RESET}")
         by_tier = defaultdict(list)
@@ -2551,11 +3109,18 @@ class FinalMextremeScanner:
                 }[tier]
                 print(f"  • {color}{tier}:{Colors.RESET} {count}")
         
+        print(f"\n{Colors.CYAN}🎯 Risk Assessment:{Colors.RESET}")
+        print(f"  • Risk Score: {self.profile.risk_score}/100")
+        
         print(f"\n{Colors.CYAN}📈 Statistics:{Colors.RESET}")
         print(f"  • Duration: {duration:.1f}s")
         print(f"  • Requests: {self.profile.metadata.get('total_requests', 0)}")
+        print(f"  • Detectors Run: {len(set(v.detector_id for v in self.vulnerabilities))}")
         
         print(f"\n{Colors.GREEN}📁 Reports saved to:{Colors.RESET} {report_dir}")
+        print(f"\n{Colors.YELLOW}💡 Positioning:{Colors.RESET}")
+        print("  MEXTREME is a low-noise, evidence-driven security assessment engine")
+        print("  focused on accuracy, explainability, and report-quality findings")
         print(f"{Colors.BOLD}{'='*70}{Colors.RESET}")
     
     def open_report(self, html_file: str):
@@ -2579,10 +3144,10 @@ class FinalMextremeScanner:
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="MEXTREME v1.1 - Professional Security Assessment Platform"
+        description="MEXTREME v2.0 - Evidence-Driven Security Assessment Platform"
     )
     
-    parser.add_argument("target", help="Target URL to scan")
+    parser.add_argument("target", nargs="?", help="Target URL to scan")
     parser.add_argument("-o", "--output", help="Output directory name")
     parser.add_argument("--no-browser", action="store_true", help="Don't open report in browser")
     parser.add_argument("--quick", action="store_true", help="Quick scan")
@@ -2591,11 +3156,60 @@ def parse_arguments():
     parser.add_argument("--max-params", type=int, default=10, help="Max parameters per URL")
     parser.add_argument("--max-queue", type=int, default=5000, help="Max crawler queue size")
     
+    # NEW: Detector filtering options
+    parser.add_argument("--tags", help="Comma-separated list of tags to include (web,injection,info,recon,timing,low-noise)")
+    parser.add_argument("--exclude-tags", help="Comma-separated list of tags to exclude")
+    
+    # NEW: Explain mode
+    parser.add_argument("--explain", action="store_true", help="Explain scan plan without executing")
+    
+    # NEW: Detector management
+    parser.add_argument("--list-detectors", action="store_true", help="List all available detectors")
+    parser.add_argument("--disable-detector", action="append", help="Disable specific detector by ID")
+    parser.add_argument("--enable-detector", action="append", help="Enable specific detector by ID")
+    
     return parser.parse_args()
 
 async def main():
     """Main entry point"""
     args = parse_arguments()
+    
+    # Handle list-detectors flag
+    if args.list_detectors:
+        print(f"\n{Colors.CYAN}Available Detectors:{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*50}{Colors.RESET}")
+        
+        # Create a dummy engine to list detectors
+        engine = DetectorEngine(None, TargetProfile(base_url="example.com"))
+        
+        for detector_id, detector in engine.registry.detectors.items():
+            tags_str = ", ".join([tag.value for tag in detector.tags])
+            enabled = detector.id in Config.ENABLED_DETECTORS
+            
+            status = f"{Colors.GREEN}✓{Colors.RESET}" if enabled else f"{Colors.RED}✗{Colors.RESET}"
+            print(f"{status} {Colors.BOLD}{detector.name}{Colors.RESET} ({detector.id})")
+            print(f"  Description: {detector.description}")
+            print(f"  Category: {detector.category} | Max Severity: {detector.severity_ceiling}")
+            print(f"  Min Confidence: {detector.confidence_floor} | Tags: {tags_str}")
+            if detector.evidence_requirements:
+                reqs = detector.evidence_requirements.get('required_evidence', [])
+                options = detector.evidence_requirements.get('evidence_options', len(reqs))
+                print(f"  Evidence: Need {options} of {reqs}")
+            print()
+        
+        print(f"{Colors.YELLOW}Usage:{Colors.RESET}")
+        print("  python mextreme.py https://example.com --tags injection,web")
+        print("  python mextreme.py https://example.com --exclude-tags info")
+        print("  python mextreme.py https://example.com --explain")
+        return
+    
+    if not args.target and not args.list_detectors:
+        print(f"{Colors.RED}Error: Target URL is required{Colors.RESET}")
+        print(f"\n{Colors.YELLOW}Usage:{Colors.RESET}")
+        print("  python mextreme.py https://example.com")
+        print("  python mextreme.py --list-detectors")
+        print("  python mextreme.py https://example.com --explain")
+        return
     
     if args.output:
         Config.OUTPUT_DIR = args.output
@@ -2621,18 +3235,39 @@ async def main():
     if args.max_queue:
         Config.MAX_QUEUE_SIZE = args.max_queue
     
-    # NEW: Apply fixes by default
-    Config.SKIP_EXTERNAL_DOMAINS = True
-    Config.GROUP_EMAIL_FINDINGS = True
-    Config.EMAIL_EXPOSURE_MAX_FINDINGS = 3
-    Config.SUPPRESS_PUBLIC_EMAILS = True
+    # Handle detector management
+    if args.disable_detector:
+        for detector_id in args.disable_detector:
+            if detector_id in Config.ENABLED_DETECTORS:
+                Config.ENABLED_DETECTORS.remove(detector_id)
+                print(f"{Colors.YELLOW}Disabled detector: {detector_id}{Colors.RESET}")
+    
+    if args.enable_detector:
+        for detector_id in args.enable_detector:
+            if detector_id not in Config.ENABLED_DETECTORS:
+                Config.ENABLED_DETECTORS.append(detector_id)
+                print(f"{Colors.GREEN}Enabled detector: {detector_id}{Colors.RESET}")
+    
+    # Parse tags
+    tags = None
+    if args.tags:
+        tags = [tag.strip() for tag in args.tags.split(',')]
+    
+    exclude_tags = None
+    if args.exclude_tags:
+        exclude_tags = [tag.strip() for tag in args.exclude_tags.split(',')]
     
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
     
     scanner = FinalMextremeScanner()
     
     try:
-        await scanner.scan(args.target)
+        await scanner.scan(
+            args.target,
+            tags=tags,
+            exclude_tags=exclude_tags,
+            explain_only=args.explain
+        )
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}⚠️  Scan interrupted{Colors.RESET}")
     except Exception as e:
@@ -2650,5 +3285,6 @@ if __name__ == "__main__":
         import dns.resolver
     except ImportError:
         print(f"{Colors.YELLOW}Warning: dnspython not installed{Colors.RESET}")
+        print(f"{Colors.CYAN}Install with: pip install dnspython{Colors.RESET}")
     
     asyncio.run(main())
