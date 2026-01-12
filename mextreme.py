@@ -8,7 +8,7 @@ LOGO = r"""
 ╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝╚══════╝
 
 MEXTREME v2.0 - Evidence-Driven Security Assessment Platform
-Version 2.0 | Low-Noise, Evidence-First Security Scanner
+Version 2.0 | Low-Noise Security Scanner
     ----Created by RocketRaccoon------
 """
 
