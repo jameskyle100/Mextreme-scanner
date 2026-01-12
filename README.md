@@ -78,7 +78,7 @@ Quick Start
 bash
 
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/jameskyle100/Mextreme-scanner.git
 cd mextreme
 
 # Install dependencies
