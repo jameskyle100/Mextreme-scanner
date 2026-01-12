@@ -63,13 +63,13 @@ Option 1: One-Line Install
 bash
 
 # Clone and install
-git clone https://github.com/yourusername/mextreme.git && cd mextreme && pip install -r requirements.txt
+git clone https://github.com/jameskyle100/mextreme.git && cd mextreme && pip install -r requirements.txt
 
 Option 2: Step-by-Step
 bash
 
 # 1. Clone the repository
-git clone https://github.com/yourusername/mextreme.git
+git clone https://github.com/jameskyle100/mextreme.git
 cd mextreme
 
 # 2. Install dependencies
@@ -81,7 +81,7 @@ chmod +x mextreme.py
 Option 3: Using requirements.txt
 bash
 
-git clone https://github.com/yourusername/mextreme.git
+git clone https://github.com/jameskyle100/mextreme.git
 cd mextreme
 pip install -r requirements.txt
 
